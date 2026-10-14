@@ -16,32 +16,41 @@ attributes (categorical or numeric, e.g. `x > 30`) that are unrelated to vector 
   exist elsewhere in the graph.
 
 ## Approach
-Organize data along a space-filling curve over the attribute dimensions. An orchestrator
-estimates predicate selectivity by intersecting the filter's range with the curve's ranges.
-
-- Very selective queries (e.g. <1% of the data): scan the matching curve segments directly.
-- Otherwise: run standard HNSW traversal.
+1. **Hilbert-Partitioned B-Tree of Subgraphs:**
+   - Map scalar attributes ($m \le 4$) to a 1D Hilbert space.
+   - Organize data into a B-Tree structure where leaf nodes cover disjoint, non-overlapping Hilbert key intervals $[K_i, K_{i+1})$.
+   - Each leaf maintains a dedicated, independent HNSW subgraph $G_i$ covering only vectors within that attribute range.
+   - **Zero Filter Overhead on Enclosed Chunks:** When a query range fully encloses a leaf's interval, 100% of its vectors are valid; the query executes unconstrained, vanilla HNSW with zero filtering degradation.
+   - Boundary leaves use within-chunk Hilbert-assisted traversal or flat scans.
+2. **Temporal Merging Scheme:**
+   - Incoming appends buffer temporally in an active in-memory tier (L0 / MemTable).
+   - Once the temporal buffer fills, items are sorted by Hilbert key and flushed into their respective Hilbert leaf partitions.
+   - **Localized Compaction:** When a leaf partition accumulates multiple temporal deltas or exceeds capacity, it splits along its median Hilbert key and rebuilds *only* its local subgraph. Cross-partition graph merging is never required, completely eliminating the intractable global HNSW merge bottleneck.
+3. **Selectivity-Based Query Routing:**
+   - An orchestrator estimates predicate selectivity by intersecting the query box with the Hilbert B-tree partitions.
+   - Very selective queries (or small leaves): scan matching contiguous vectors directly via SIMD.
+   - Moderate-to-broad queries: route to active subgraphs in parallel, utilizing valid Hilbert entry seeds for boundary leaves and vanilla HNSW for fully covered leaves.
 
 ## Goals
-- Return the full k results with high recall under filtered queries across all selectivity
-  levels, including highly selective predicates where post-filtering fails.
-- Estimate selectivity cheaply before execution using the space-filling curve layout.
-- Route each query automatically to curve-segment scanning or graph traversal based on
-  that estimate.
-- Evaluate recall@k and query throughput against pre-filtering and post-filtering baselines.
+- Return the full k results with high recall across all selectivity levels, including highly selective predicates (<1%) where post-filtering starves.
+- Design and evaluate a Hilbert-partitioned B-Tree of subgraphs that eliminates cross-segment graph rewiring.
+- Implement a temporal merging scheme that buffers appends and restricts graph rebuilds strictly to localized partition leaves.
+- Formulate a cost-based optimizer to route dynamically between SIMD flat scans and partitioned subgraph traversals.
+- Evaluate recall@k, latency, and index maintenance overhead against plain HNSW and ACORN-style filtered baselines.
 
 ## Scope
 **In scope**
-- Filtered k-NN queries over vectors with categorical and numeric attributes
-- A space-filling-curve data layout and selectivity estimator
-- An orchestrator that picks the execution plan
-- An HNSW-based prototype
-- Benchmarks sweeping predicate selectivity
+- Filtered k-NN queries over vectors with continuous numeric and categorical attributes ($m \le 4$)
+- Hilbert-partitioned B-tree data layout with dedicated HNSW subgraphs
+- Temporal append buffering and localized leaf compaction model
+- Selectivity estimation via Hilbert range decomposition and B-tree boundary pruning
+- Cost-based query router (SIMD scan vs. Hilbert-seeded HNSW traversal)
+- Benchmarks sweeping predicate selectivity, attribute dimension, and data correlation
 
 **Out of scope**
-- Distributed or disk-resident indexes
-- Online updates and deletes
-- Production-grade engine integration
+- Distributed clusters (single-node multi-threaded evaluation)
+- Complex ACID transaction concurrency (focus on read-optimized lakehouse / append-mostly workloads)
+- Arbitrary schema changes beyond defined attribute dimensions
 
 ## Deliverable
 | Deliverable | Weight | Due |
@@ -74,9 +83,20 @@ estimates predicate selectivity by intersecting the filter's range with the curv
    State this as an explicit limitation.
 5. **Routing threshold.** Replace the fixed 1% cutoff with a cost model: estimated count ×
    vector dimension vs. calibrated graph-traversal cost. Report the measured crossover.
+6. **Partition skew & dynamic splitting.** Non-uniform attribute distributions cause certain
+   Hilbert ranges to accumulate more data. Leaves must split dynamically along the median
+   Hilbert key when capacity threshold $N_{\max}$ is reached.
+7. **Scatter-gather fanout on broad queries.** Queries with broad selectivity (>30%) touch
+   multiple partition subgraphs. Evaluate the crossover where searching multiple subgraphs
+   becomes slower than a single unified graph.
 
 ## Evaluation plan additions
 - Baselines beyond pre-filtering/post-filtering: post-filtering with adaptive `ef`, ACORN;
   SeRF or iRangeGraph if numeric ranges are central.
 - Report selectivity-estimator accuracy (q-error) as its own result.
 - Sweep attribute dimensionality as well as selectivity.
+- Sweep leaf partition capacity ($N_{\max} \in [10k, 50k, 100k]$) to quantify the trade-off
+  between chunk pruning granularity and multi-graph scatter-gather overhead.
+- Benchmark ingestion throughput and compaction latency under temporal stream appends:
+  measure time to merge temporal deltas and rebuild localized subgraphs vs. global rebuild.
+

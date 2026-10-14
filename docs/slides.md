@@ -15,22 +15,24 @@
 Modern vector databases struggle when queries combine high-dimensional similarity search with multi-attribute scalar constraints (e.g., $d=128$ embedding with `price BETWEEN 20 AND 50 AND rating >= 4.5`).
 
 ### Proposed Solution
-Use a **space-filling Hilbert curve** over low-dimensional scalar attribute space ($m \le 4$) to augment a Hierarchical Navigable Small World (HNSW) vector index.
+A **Hilbert-Partitioned B-Tree of Subgraphs** paired with a **Temporal Merging Scheme**:
+* Low-dimensional attributes ($m \le 4$) are linearized into a 1D Hilbert key space.
+* Physical data is partitioned into a B-Tree where leaf nodes cover disjoint Hilbert intervals $[K_i, K_{i+1})$ hosting dedicated, independent HNSW subgraphs.
+* A temporal LSM-style buffer ingests stream appends and flushes localized delta batches without requiring global graph rewiring.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │                        CORE ARCHITECTURAL ROLES                        │
 ├────────────────────────────────┬───────────────────────────────────────┤
 │ 1. Zero-Cost Selectivity Est.  │ O(#intervals * log N) via sorted keys │
-│ 2. Exact Chunk-Level Skipping  │ Zone Maps [min, max] prune cold files │
-│ 3. Instant Scan Path           │ Contiguous SIMD scans for sel < 1%    │
-│ 4. Valid Seed Placement        │ Parachutes graph traversal into valid │
-│                                │ neighborhoods without disconnections  │
+│ 2. Disjoint Chunk Pruning      │ B-Tree bounds prune non-overlapping   │
+│ 3. Zero-Filter Subgraph Search │ 100% vanilla HNSW on enclosed leaves  │
+│ 4. Localized Temporal Merge    │ Graph rebuilds bounded to single leaf │
 └────────────────────────────────┴───────────────────────────────────────┘
 ```
 
 > [!NOTE]
-> **Key Thesis:** Rather than attempting to map high-dimensional embeddings to 1D curves (which fails), we use the Hilbert curve solely for **multi-attribute scalar indexing and graph navigation assistance**.
+> **Key Thesis:** By partitioning data into a Hilbert B-Tree of independent subgraphs, we eliminate the catastrophic global graph-merge bottleneck of LSM vector stores and achieve zero-filtering overhead on fully enclosed partitions.
 
 ---
 
@@ -66,28 +68,31 @@ Vector databases face a trilemma across the selectivity spectrum ($s = |V_{\text
 
 ```mermaid
 flowchart TD
-    Q["User Query: vector q + Box [lo, hi]"] --> P{"Filter Present?"}
+    Q["Query: vector q + Box [lo, hi]"] --> P{"Filter Present?"}
     
-    P -- "No (Pure ANN)" --> B["Bypass Hilbert Entirely\n(Vanilla HNSW, 0 Overhead)"]
+    P -- "No (Pure ANN)" --> B["Bypass Hilbert Router\n(Fan out to all subgraphs directly)"]
     
-    P -- "Yes" --> D["Hilbert Hypercube Decomposition\n[lo, hi] -> [s1, e1), [s2, e2)..."]
+    P -- "Yes" --> D["Hilbert Range Decomposition\n[lo, hi] -> [s1, e1), [s2, e2)..."]
     
-    D --> ZM["Macro-Pruning: Zone Maps\nSkip non-overlapping chunks"]
+    D --> BT["B-Tree Partition Router\nFind overlapping leaf partitions"]
     
-    ZM --> SE["Micro-Estimation: Binary Search\nCompute exact candidate count"]
+    BT --> L1["Leaf 1: Fully Enclosed\n[K1, K2) ⊂ Query Range"]
+    BT --> L2["Leaf 2: Boundary / Partial\n[K2, K3) ∩ Query Range"]
+    BT --> L3["Leaf 3: Disjoint\nPruned! (0 CPU / 0 Math)"]
     
-    SE --> R{"Cost Optimizer\nValid Count < Threshold?"}
+    L1 --> V["Vanilla Unconstrained HNSW\n(Zero Filter Overhead!)"]
+    L2 --> C{"Candidate Count?"}
+    C -- "Small" --> FS["Contiguous SIMD Scan"]
+    C -- "Large" --> SH["Hilbert-Seeded HNSW"]
     
-    R -- "Yes (<1% selectivity)" --> S["Contiguous SIMD Scan\n(100% Recall, High Bandwidth)"]
-    R -- "No (>1% selectivity)" --> G["Hilbert-Seeded HNSW\n(Sample valid seeds near q)"]
-    
-    S --> AGG["Merge Top-K Results"]
-    G --> AGG
+    V --> AGG["Global Top-K Min-Heap"]
+    FS --> AGG
+    SH --> AGG
     B --> AGG
 ```
 
-* **Decoupled Responsibilities:** Scalar range logic is handled by interval algebra; vector similarity is handled by graph traversal or SIMD dot products.
-* **Graceful Degradation:** When filters are absent, the engine falls back to standard HNSW with zero penalty.
+* **Decoupled Responsibilities:** Scalar ranges routed by B-Tree interval algebra; vector search localized to dedicated subgraphs.
+* **Graceful Degradation:** When filters are absent, all subgraphs execute vanilla HNSW with zero penalty.
 
 ---
 
@@ -125,8 +130,8 @@ Attribute Space (2D)                    Hilbert Curve (1D Key Space)
 ### The Entry-Point Cold-Start Problem
 In filtered HNSW (like ACORN), standard top-layer entry points descend to nodes that may be invalid or far from the target valid cluster. The search must wander through invalid terrain to find valid clusters.
 
-### Hilbert-Seeded Traversal
-Instead of starting blindly from the global entry point:
+### Hilbert-Seeded Traversal (For Boundary Partitions)
+For partitions that partially overlap the query range:
 1. Extract candidate IDs from matching Hilbert slices.
 2. Sample a small seed budget ($B \approx \min(32, |V_{\text{valid}}|)$).
 3. Score candidates against query $q$ and select the top $N_{\text{seeds}}$ valid points closest to $q$.
@@ -154,28 +159,37 @@ Instead of starting blindly from the global entry point:
 
 <!-- slide -->
 
-# Slide 6: Systems Architecture — Frozen Chunks & Zone Maps
+# Slide 6: Systems Architecture — Hilbert B-Tree & Temporal Merging
 
-### The Storage Dilemma: Why Not Dynamic Re-Sorting?
-Single-row inserts cannot be appended to flat sorted arrays without $O(N)$ array shifts. Furthermore, merging HNSW graphs during LSM compaction is computationally prohibitive ($O(N \cdot M \log N \cdot d)$ floating-point distance calculations).
-
-### The Lakehouse Solution: Segmented / Frozen Chunks
-Adopt the standard columnar vector lakehouse pattern (LanceDB / Milvus / ClickHouse):
-
+```mermaid
+flowchart LR
+    subgraph Ingestion ["Ingestion Tier"]
+        W["Append Stream"] --> L0["L0 Temporal Buffer\n(MemTable, e.g. 50k rows)"]
+    end
+    
+    subgraph Routing ["Hilbert B-Tree Router"]
+        L0 -- "Flush & Sort" --> BTR["Route by Hilbert Key"]
+    end
+    
+    subgraph Leaves ["Partitioned Subgraphs (L1)"]
+        BTR --> P1["Partition 1: [0, K1)\nLocal Graph G1"]
+        BTR --> P2["Partition 2: [K1, K2)\nLocal Graph G2"]
+        BTR --> P3["Partition 3: [K2, K3)\nLocal Graph G3"]
+    end
+    
+    subgraph Compaction ["Localized Compaction"]
+        P2 -- "Over Capacity > Nmax" --> SP["Split at Median Hilbert Key\nRebuild ONLY G2a & G2b"]
+    end
 ```
-┌────────────────────────────────────────────────────────┐
-│                   FROZEN CHUNK (e.g. 200k vectors)     │
-├────────────────────────────────────────────────────────┤
-│ Header: Zone Map [min_key, max_key] (16 bytes)         │
-│ Payload: Vectors X (Row or Columnar)                   │
-│ Local Hilbert Index: sorted skeys + order array        │
-│ Local HNSW Graph: frozen proximity graph               │
-└────────────────────────────────────────────────────────┘
-```
 
-1. **Chunk-Level Pruning (Macro):** Check query Hilbert intervals against each chunk's Zone Map $[min\_key, max\_key]$. Non-overlapping chunks are skipped instantly with zero I/O or vector math.
-2. **Per-Chunk Plan Selection (Micro):** Surviving chunks independently decide whether to execute a flat SIMD scan or a Hilbert-seeded graph search.
-3. **No Graph Merges:** Chunks remain immutable. New writes enter an append buffer or new chunk.
+### The Ingestion & Compaction Lifecycle
+
+1. **L0 Temporal Buffering:** Incoming appends land in an active in-memory buffer. Unfiltered searches scan L0 directly via SIMD.
+2. **Hilbert-Partitioned Flushing:** When L0 fills, points are sorted by Hilbert key and dispatched into leaf partition buffers.
+3. **The "Zero Cross-Graph Merge" Guarantee:**
+   * Traditional vector LSM-stores must rewire edges across the entire dataset during compaction ($O(N \cdot M \log N \cdot d)$ floating-point distance math).
+   * **Our approach:** Graph rebuilds are strictly **contained within a single leaf**. Partitions are permanently disjoint in Hilbert space; cross-partition graph rewiring is **never** required.
+4. **Dynamic Median Splitting:** When leaf size exceeds $N_{\max}$ (e.g. 50k), it splits into two leaves along the median Hilbert key, balancing data skew.
 
 ---
 
@@ -183,46 +197,45 @@ Adopt the standard columnar vector lakehouse pattern (LanceDB / Milvus / ClickHo
 
 # Slide 7: Core Strengths & Advantages
 
-### 1. Superior High-Selectivity Performance (<1%)
+### 1. Zero Filter Overhead on Fully Enclosed Leaves
+* When a query interval completely spans a leaf's Hilbert bounds $[K_i, K_{i+1})$, **100% of the vectors in that leaf are valid**.
+* Traversal runs as **pure, unconstrained vanilla HNSW**—no ACORN hopping, no bitmask checks, no graph disconnection penalties.
+
+### 2. High-Selectivity Acceleration (<1%)
 * When $<1\%$ of data matches, graph traversal overhead is completely bypassed.
 * Contiguous Hilbert slices allow streaming, cache-aligned vector scans utilizing AVX-512 / ARM Neon SIMD vectorization.
 * Guarantees **100% recall** where post-filtering starves.
-
-### 2. Native Multi-Attribute Correlation
-* Resolves joint range queries (e.g., `lat`, `lon`, `timestamp`, `price`) in a single pass.
-* Eliminates the CPU and memory overhead of intersecting independent bitmaps.
 
 ### 3. Lightweight Index Footprint
 * Auxiliary Hilbert structures (`skeys`, `order`, `Aq`) require only **16–20 bytes per vector**.
 * Adds **$<3\%$ memory overhead** over baseline HNSW graph edges and raw vectors.
 
-### 4. Zero Cold-Start Trapping
-* Hilbert entry seeding eliminates graph disconnections for correlated attributes, allowing ACORN-style filtered traversals to converge with much smaller $ef$ search bounds.
+### 4. Non-Blocking Localized Maintenance
+* Stream appends and compaction tasks only lock or rebuild the single target leaf partition, keeping the rest of the database online and low-latency.
 
 ---
 
 <!-- slide -->
 
-# Slide 8: Critical Weaknesses & Failure Modes
+# Slide 8: Critical Weaknesses & Systems Trade-Offs
 
 > [!WARNING]
 > Understanding the failure modes is essential for defining the operational boundaries of this architecture.
 
-### 1. The Curse of Attribute Dimensionality ($m > 4$)
+### 1. Scatter-Gather Penalty on Broad Queries
+* For broad queries (e.g. 50% selectivity or unconstrained pure ANN), the query intersects many leaf partitions.
+* Searching 20 small subgraphs of size $N/20$ incurs 20 separate entry-point descents, which can exceed the cost of searching a single unified graph of size $N$.
+
+### 2. The Curse of Attribute Dimensionality ($m > 4$)
 * Hypercube decomposition exhibits $O(2^m)$ branching.
 * For $m \ge 6$, decomposing a query yields thousands of disjoint 1D intervals.
-* **Consequence:** Interval decomposition time exceeds vector search time, and contiguous scanning degenerates into random seeks.
+* **Mitigation:** Use an ensemble of low-dimensional subspace curves (e.g. separate 2D curves for spatial and commercial attributes).
 
-### 2. The Unconstrained Dimension Trap ("Hyper-Slabs")
-* If the curve indexes $(x, y, z)$, but a query only filters on $x$ (`x > 50`), the query represents an infinite geometric slab across $y$ and $z$.
-* Slicing an unconstrained slab across a Hilbert curve shatters into an immense number of tiny intervals, destroying locality.
+### 3. The Unconstrained Dimension Trap ("Hyper-Slabs")
+* If the curve indexes $(x, y, z)$, but a query only filters on $x$ (`x > 50`), the query represents an infinite geometric slab across $y$ and $z$, shattering into many small intervals.
 
-### 3. Seed Over-Budgeting Overhead
-* Scoring $B$ seed candidates requires $B$ exact vector distance computations.
-* If $B=512$ while HNSW traversal needs only $200$ distance checks, the "seed preparation" step becomes a net performance loss.
-
-### 4. Rigid Index Schema
-* Attributes must be fixed at index build time. Dynamic queries on unindexed columns require fallback filtering.
+### 4. Attribute Partitioning vs. Semantic Locality
+* Two identical vectors with slightly different attributes (e.g. price \$49.99 vs \$50.01) fall into different partition subgraphs, precluding direct graph edge connectivity between them.
 
 ---
 
@@ -230,7 +243,7 @@ Adopt the standard columnar vector lakehouse pattern (LanceDB / Milvus / ClickHo
 
 # Slide 9: Experimental Evaluation Plan
 
-To evaluate Hilbert-HNSW rigorously for CSE532, we conduct empirical sweeps across four axes:
+To evaluate Hilbert-HNSW rigorously for CSE532, we conduct empirical sweeps across five axes:
 
 ```
                       EVALUATION MATRIX
@@ -240,16 +253,16 @@ To evaluate Hilbert-HNSW rigorously for CSE532, we conduct empirical sweeps acro
 │ 1. Predicate Sel.     │ 0.1%, 0.5%, 1%, 5%, 10%, 25%, 50%          │
 │ 2. Attribute Dim. (m) │ m ∈ {1, 2, 3, 4, 6}                        │
 │ 3. Data Correlation   │ Independent Uniform vs. Correlated Embed.  │
-│ 4. Seed Budget (B)    │ B ∈ {0, 8, 32, 64, 128, 512}               │
+│ 4. Leaf Capacity Nmax │ 5k, 10k, 25k, 50k vectors per subgraph     │
+│ 5. Compaction Latency │ Localized Leaf Rebuild vs. Global Rebuild  │
 └───────────────────────┴────────────────────────────────────────────┘
 ```
 
 ### Key Metrics to Report
 1. **Recall@10 vs. Distance Computations (`ndis`):** Pareto frontier of search efficiency.
-2. **Selectivity Estimator Accuracy (q-error):**
+2. **Compaction Throughput (Vectors/sec):** Measuring time to ingest and compact streaming appends under localized vs. global graph maintenance.
+3. **Selectivity Estimator Accuracy (q-error):**
    $$\text{q-error} = \max\left(\frac{\hat{N}}{N}, \frac{N}{\hat{N}}\right)$$
-   Measures estimation fidelity across `max_depth` settings.
-3. **Decomposition Overhead vs. Query Latency:** Demonstrating the crossover point where high $m$ degrades performance.
 4. **Baselines:** Plain Post-Filtered HNSW, Pure Flat Scan, and ACORN-1 traversal.
 
 ---
@@ -259,20 +272,20 @@ To evaluate Hilbert-HNSW rigorously for CSE532, we conduct empirical sweeps acro
 # Slide 10: Conclusion & Project Roadmap
 
 ### Takeaway
-Hilbert-Assisted Filtered HNSW is **not a replacement for all general-purpose vector filtering**, but it is a **highly potent physical layout and entry-seeding engine** for:
-* Low-to-medium continuous attribute dimensions ($m \le 4$).
-* Spatio-temporal and sensor workloads (e.g., geospatial coordinates + time).
-* High-selectivity regimes where traditional graph traversal fails.
+A **Hilbert-Partitioned B-Tree of Subgraphs with Temporal Merging** addresses the two biggest pain points in modern vector systems:
+1. **At Query Time:** Eliminates the mid-selectivity filtered HNSW crash by converting fully enclosed ranges into vanilla unconstrained graph searches.
+2. **At Ingestion Time:** Replaces the intractable $O(N \log N \cdot d)$ global graph merge with bounded, localized leaf compaction.
 
 ### CSE532 Technical Report Roadmap
 
 ```mermaid
 flowchart LR
-    A["Prototype Complete\n(hilbert_hnsw.py)"] --> B["Formal Cost Model\n(Calibrate crossover)"]
-    B --> C["Benchmark Matrix\n(Sweep m, sel, corr)"]
-    C --> D["Draft 6-Page Report\n(Prof. Shuai Mu)"]
+    A["Prototype Complete\n(hilbert_hnsw.py)"] --> B["B-Tree Partition Model\n(Disjoint leaf subgraphs)"]
+    B --> C["Temporal Compaction Bench\n(Localized vs Global Rebuild)"]
+    C --> D["Full Benchmark Suite\n(Sweep sel, m, Nmax)"]
+    D --> E["Draft 6-Page Report\n(Prof. Shuai Mu)"]
 ```
 
-* **Immediate Next Step:** Calibrate the dynamic cost model threshold ($\text{Cost}_{\text{scan}}$ vs $\text{Cost}_{\text{graph}}$) and benchmark the dimensionality ceiling on synthetic & real datasets.
+* **Immediate Next Step:** Benchmark the crossover point where partitioned multi-subgraph search outperforms a single unified graph across the selectivity spectrum.
 
 ---
