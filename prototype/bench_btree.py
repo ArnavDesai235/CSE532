@@ -25,14 +25,30 @@ def run_benchmark():
     print("CSE532 Prototype: Hilbert-Partitioned B-Tree of Subgraphs with Temporal Merging")
     print("=" * 80)
 
-    # 1. Generate Vectors and Attributes (correlated vs independent)
+    # 1. Generate Vectors and Attributes (correlated vs independent vs multi-density clusters)
     corr = "--corr" in sys.argv
-    X = rng.standard_normal((n, d)).astype("float32")
-    if corr:
+    clusters = "--clusters" in sys.argv
+    if clusters:
+        # Multi-density distribution: dense clusters vs dispersed background
+        X = np.empty((n, d), dtype=np.float32)
+        A = np.empty((n, 2), dtype=np.float32)
+        # Cluster 1: tight dense cluster (std=0.1)
+        X[:10000] = rng.normal(loc=0.0, scale=0.1, size=(10000, d))
+        A[:10000] = rng.uniform(0.0, 0.25, size=(10000, 2))
+        # Cluster 2: moderate dispersion (std=1.0)
+        X[10000:25000] = rng.normal(loc=2.0, scale=1.0, size=(15000, d))
+        A[10000:25000] = rng.uniform(0.25, 0.6, size=(15000, 2))
+        # Cluster 3: sparse/dispersed (std=3.0)
+        X[25000:] = rng.normal(loc=5.0, scale=3.0, size=(15000, d))
+        A[25000:] = rng.uniform(0.6, 1.0, size=(15000, 2))
+        print("Attribute Distribution: MULTI-DENSITY CLUSTERED vector space (dense vs sparse partitions)")
+    elif corr:
+        X = rng.standard_normal((n, d)).astype("float32")
         A = X[:, :2] + 0.4 * rng.standard_normal((n, 2))
         A = (A - A.min(0)) / (A.max(0) - A.min(0))
         print("Attribute Distribution: CORRELATED with vector embedding space")
     else:
+        X = rng.standard_normal((n, d)).astype("float32")
         A = rng.random((n, 2)).astype("float32")
         print("Attribute Distribution: INDEPENDENT uniform attributes")
 
@@ -46,8 +62,11 @@ def run_benchmark():
     build_time = time.time() - t0
     num_leaves = len(engine.router.leaves)
     degrees = [leaf.M for leaf in engine.router.leaves]
+    apds = [engine.tuner.compute_apd(leaf.X) for leaf in engine.router.leaves]
     print(f"    Built {num_leaves} leaf partitions in {build_time:.2f}s")
+    print(f"    Local Vector Dispersion (APD per leaf): {[f'{a:.2f}' for a in apds]}")
     print(f"    Adaptive Sparsity Degrees M_i across leaves: {degrees} (mean: {np.mean(degrees):.1f})")
+    print(f"    Dense Vector Clusters -> PRUNED edges (M_i={min(degrees)}), Dispersed Clusters -> DENSE edges (M_i={max(degrees)})")
 
     def calc_recall(found, truth):
         if len(truth) == 0:
