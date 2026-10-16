@@ -1,4 +1,9 @@
-"""HPC Distributed MPI Benchmark for Hilbert-Partitioned B-Tree Vector Engine.
+"""HPC Distributed MPI Benchmark: Hilbert-Partitioned B-Tree vs. Traditional Sharded HNSW.
+
+Evaluates distributed performance in HPC / Slurm cluster environments:
+  1. Distributed Sharded HNSW (Post-Filtering): Industry baseline (random horizontal vector sharding).
+  2. Distributed Sharded HNSW (In-Graph Filtered Beam Search): Standard in-graph filtering across all ranks.
+  3. Distributed Hilbert B-Tree (Our Approach): Range-partitioned distributed Hilbert curve + Zone Map rank pruning.
 
 Usage:
   # On Slurm HPC cluster:
@@ -12,7 +17,12 @@ import sys
 import time
 import numpy as np
 
-from hilbert_btree_mpi import DistributedMPIHilbertEngine, get_mpi_comm, HAVE_MPI
+from hilbert_btree_mpi import (
+    DistributedMPIHilbertEngine,
+    DistributedShardedHNSW,
+    get_mpi_comm,
+    HAVE_MPI,
+)
 
 
 def run_mpi_benchmark():
@@ -40,12 +50,12 @@ def run_mpi_benchmark():
             m = int(sys.argv[i + 1])
 
     if rank == 0:
-        print("=" * 105)
-        print("CSE532 Distributed MPI Benchmark: Hilbert B-Tree Engine in HPC / Slurm Environment")
+        print("=" * 115)
+        print("CSE532 Distributed MPI Benchmark: Hilbert B-Tree vs. Traditional Sharded HNSW (HPC / Slurm)")
         print(f"MPI Topology: {size} Ranks | Dataset: N={n:,}, d={d}, m={m} attributes | Max Leaf Size: {max_leaf_size:,}")
         if not HAVE_MPI:
             print(">> Notice: mpi4py not detected. Running in single-node mock MPI emulation mode.")
-        print("=" * 105)
+        print("=" * 115)
 
     # 1. Dataset Generation on Rank 0
     rng = np.random.default_rng(42)
@@ -59,35 +69,56 @@ def run_mpi_benchmark():
     else:
         X, A, Q = None, None, None
 
-    # Broadcast queries to all ranks so ground truth or query shapes are accessible
     Q = comm.bcast(Q, root=0)
 
-    # 2. Distributed Engine Construction
+    # 2. Build Distributed Sharded HNSW (Traditional Baseline)
     if rank == 0:
-        print(f"\n[2] Initializing Distributed Engine Across {size} MPI Ranks...")
+        print(f"\n[2] Building Traditional Distributed Sharded HNSW Baseline ({size} Ranks)...")
     comm.Barrier()
-    t_engine_start = time.time()
+    t0 = time.time()
+    engine_sharded = DistributedShardedHNSW(X=X, A=A, d=d, M=20, ef_construction=100, comm=comm)
+    comm.Barrier()
+    sharded_build_time = time.time() - t0
 
-    engine = DistributedMPIHilbertEngine(
+    sharded_mem = engine_sharded.get_rank_memory_footprint()
+    all_sharded_mem = comm.gather(sharded_mem, root=0)
+
+    # 3. Build Distributed Hilbert-Partitioned B-Tree (Our Approach)
+    if rank == 0:
+        print(f"\n[3] Building Distributed Hilbert-Partitioned B-Tree ({size} Ranks, max_leaf_size={max_leaf_size:,})...")
+    comm.Barrier()
+    t0 = time.time()
+    engine_hilbert = DistributedMPIHilbertEngine(
         X=X, A=A, p=10, max_leaf_size=max_leaf_size,
         subspace_dim=2, comm=comm
     )
-
     comm.Barrier()
-    total_build_time = time.time() - t_engine_start
+    hilbert_build_time = time.time() - t0
 
-    # Collect memory and partition statistics from all ranks
-    local_mem = engine.get_rank_memory_footprint()
-    all_mem = comm.gather(local_mem, root=0)
+    hilbert_mem = engine_hilbert.get_rank_memory_footprint()
+    all_hilbert_mem = comm.gather(hilbert_mem, root=0)
 
+    # 4. Memory Footprint Comparison Across Ranks
     if rank == 0:
-        print(f"    Built distributed index in {total_build_time:.2f}s across {size} ranks")
-        total_leaves = sum(m["num_leaves"] for m in all_mem)
-        total_mb = sum(m["total_mb"] for m in all_mem)
-        avg_mb = total_mb / size
-        print(f"    Total Leaf Partitions: {total_leaves} (avg {total_leaves / size:.1f} leaves/rank)")
-        print(f"    Aggregate Index Memory: {total_mb:.2f} MB (avg {avg_mb:.2f} MB per MPI rank)")
-        print(f"    Max Leaf Build Time: {max(m['total_bytes'] for m in all_mem) / (1024 * 1024):.2f} MB highest rank load")
+        print("\n[4] Distributed Memory Footprint Comparison Across MPI Ranks:")
+        print(f"{'Component':<35} | {'Trad. Sharded HNSW':>20} | {'Hilbert B-Tree':>20} | {'Difference':>15}")
+        print("-" * 98)
+
+        total_sharded_mb = sum(m["total_mb"] for m in all_sharded_mem)
+        total_hilbert_mb = sum(m["total_mb"] for m in all_hilbert_mem)
+        total_sharded_graph = sum(m["graph_mb"] for m in all_sharded_mem)
+        total_hilbert_graph = sum(m["graph_mb"] for m in all_hilbert_mem)
+        total_sharded_vec = sum(m["vec_mb"] for m in all_sharded_mem)
+        total_hilbert_vec = sum(m["vec_mb"] for m in all_hilbert_mem)
+        total_sharded_aux = sum(m["aux_mb"] for m in all_sharded_mem)
+        total_hilbert_aux = sum(m["aux_mb"] for m in all_hilbert_mem)
+
+        print(f"{'Raw Vector Storage (float32)':<35} | {total_sharded_vec:>17.2f} MB | {total_hilbert_vec:>17.2f} MB | {total_hilbert_vec - total_sharded_vec:>12.2f} MB")
+        print(f"{'Graph Index Edges (HNSW Links)':<35} | {total_sharded_graph:>17.2f} MB | {total_hilbert_graph:>17.2f} MB | {total_hilbert_graph - total_sharded_graph:>12.2f} MB")
+        print(f"{'Auxiliary Data (Attrs, Keys, IDs)':<35} | {total_sharded_aux:>17.2f} MB | {total_hilbert_aux:>17.2f} MB | {total_hilbert_aux - total_sharded_aux:>12.2f} MB")
+        print("-" * 98)
+        print(f"{'Total Distributed Memory':<35} | {total_sharded_mb:>17.2f} MB | {total_hilbert_mb:>17.2f} MB | {total_hilbert_mb - total_sharded_mb:>12.2f} MB")
+        print(f"{'Index Build Wall-Clock Time':<35} | {sharded_build_time:>18.2f}s | {hilbert_build_time:>18.2f}s | {hilbert_build_time - sharded_build_time:>13.2f}s")
 
     def calc_recall(found, truth):
         if len(truth) == 0:
@@ -113,30 +144,30 @@ def run_mpi_benchmark():
             hi[a2] = c[1] + side
         return lo, hi
 
-    # 3. Distributed Filtered Search Sweep
+    # 5. Distributed Filtered Search Comparison Sweep
     if rank == 0:
-        print(f"\n[3] Distributed Multi-Attribute Filtered Search across Selectivity Spectrum ({m} Attributes):")
-        header = (f"{'Selectivity':>12} | {'Recall@10':>10} | {'Total Latency':>15} | "
-                  f"{'Max Worker':>12} | {'MPI Network':>13} | {'Active Ranks':>14} | {'Dist Comps':>12}")
+        print(f"\n[5] Distributed Filtered Query Performance across Selectivity Spectrum ({m} Attributes):")
+        header = (f"{'Sel':>6} | "
+                  f"{'Sharded Post (Rec / Lat)':>25} | "
+                  f"{'Sharded Beam (Rec / Lat / Dist)':>31} | "
+                  f"{'Hilbert B-Tree (Rec / Lat / Dist)':>33} | "
+                  f"{'Active Ranks (Hil / Shd)':>24} | "
+                  f"{'Speedup':>9}")
         print(header)
         print("-" * len(header))
 
     for sel in [0.005, 0.02, 0.05, 0.10, 0.25]:
-        recalls = []
-        latencies = []
-        worker_times = []
-        network_times = []
-        active_ranks_list = []
-        ndis_list = []
+        r_post, lat_post = [], []
+        r_beam, lat_beam, nd_beam = [], [], []
+        r_hil, lat_hil, nd_hil = [], [], []
+        active_hil_list = []
 
         for qi in range(nq):
             if rank == 0:
                 lo, hi = make_query_box(sel, qi)
-                # Compute ground truth on Rank 0
                 in_range = np.all((A >= lo) & (A <= hi), axis=1)
                 valid_gids = np.where(in_range)[0]
                 if len(valid_gids) < k:
-                    # Skip queries with insufficient candidates
                     lo, hi = None, None
                     truth = np.empty(0, dtype=np.int64)
                 else:
@@ -147,37 +178,51 @@ def run_mpi_benchmark():
                 lo, hi = None, None
                 truth = None
 
-            # Execute distributed search
+            # 1. Sharded HNSW Post-Filtering
             comm.Barrier()
             t0 = time.perf_counter()
-            global_ids, global_dists, stats = engine.search(Q[qi], lo_raw=lo, hi_raw=hi, k=k, ef=ef)
-            t_total_ms = (time.perf_counter() - t0) * 1000.0
+            ids_post, _, _ = engine_sharded.search(Q[qi], lo_raw=lo, hi_raw=hi, k=k, ef=ef, mode="post")
+            t_post = (time.perf_counter() - t0) * 1000.0
+
+            # 2. Sharded HNSW In-Graph Filtered Beam Search
+            comm.Barrier()
+            t0 = time.perf_counter()
+            ids_beam, _, st_beam = engine_sharded.search(Q[qi], lo_raw=lo, hi_raw=hi, k=k, ef=ef, mode="beam")
+            t_beam = (time.perf_counter() - t0) * 1000.0
+
+            # 3. Distributed Hilbert B-Tree
+            comm.Barrier()
+            t0 = time.perf_counter()
+            ids_hil, _, st_hil = engine_hilbert.search(Q[qi], lo_raw=lo, hi_raw=hi, k=k, ef=ef)
+            t_hil = (time.perf_counter() - t0) * 1000.0
 
             if rank == 0 and len(truth) >= k:
-                recalls.append(calc_recall(global_ids, truth))
-                latencies.append(t_total_ms)
-                worker_times.append(stats["max_local_time_ms"])
-                network_times.append(stats["bcast_time_ms"] + stats["gather_time_ms"])
-                active_ranks_list.append(stats["active_ranks"])
-                ndis_list.append(stats["ndis"])
+                r_post.append(calc_recall(ids_post, truth))
+                lat_post.append(t_post)
+
+                r_beam.append(calc_recall(ids_beam, truth))
+                lat_beam.append(t_beam)
+                nd_beam.append(st_beam["ndis"])
+
+                r_hil.append(calc_recall(ids_hil, truth))
+                lat_hil.append(t_hil)
+                nd_hil.append(st_hil["ndis"])
+                active_hil_list.append(st_hil["active_ranks"])
 
         if rank == 0:
-            avg_rec = np.mean(recalls) if recalls else 0.0
-            avg_lat = np.mean(latencies) if latencies else 0.0
-            avg_work = np.mean(worker_times) if worker_times else 0.0
-            avg_net = np.mean(network_times) if network_times else 0.0
-            avg_act = np.mean(active_ranks_list) if active_ranks_list else 0.0
-            avg_nd = np.mean(ndis_list) if ndis_list else 0.0
+            post_str = f"{np.mean(r_post):.3f} / {np.mean(lat_post):5.2f}ms"
+            beam_str = f"{np.mean(r_beam):.3f} / {np.mean(lat_beam):5.2f}ms / {np.mean(nd_beam):5.0f}"
+            hil_str = f"{np.mean(r_hil):.3f} / {np.mean(lat_hil):5.2f}ms / {np.mean(nd_hil):5.0f}"
+            ranks_str = f"{np.mean(active_hil_list):.1f} / {size}"
+            sp = np.mean(lat_beam) / np.mean(lat_hil) if np.mean(lat_hil) > 0 else 1.0
 
-            print(f"{sel:>12.3f} | {avg_rec:>10.3f} | {avg_lat:>13.2f}ms | "
-                  f"{avg_work:>10.2f}ms | {avg_net:>11.3f}ms | {avg_act:>9.1f} / {size:<2} | {avg_nd:>12.0f}")
+            print(f"{sel:>6.3f} | {post_str:>25} | {beam_str:>31} | {hil_str:>33} | {ranks_str:>24} | {sp:>8.2f}x")
 
-    # 4. Pure Unconstrained ANN Search
+    # 6. Pure Unconstrained ANN Search Comparison
     if rank == 0:
-        print("\n[4] Distributed Pure Unconstrained ANN Search (No Filters):")
-        uncons_recalls = []
-        uncons_lats = []
-        uncons_nets = []
+        print("\n[6] Distributed Pure Unconstrained ANN Search (No Filters):")
+        r_shd_u, lat_shd_u = [], []
+        r_hil_u, lat_hil_u = [], []
 
     for qi in range(nq):
         if rank == 0:
@@ -187,23 +232,30 @@ def run_mpi_benchmark():
         else:
             truth = None
 
+        # Sharded unconstrained
         comm.Barrier()
         t0 = time.perf_counter()
-        global_ids, _, stats = engine.search(Q[qi], lo_raw=None, hi_raw=None, k=k, ef=ef)
-        t_total_ms = (time.perf_counter() - t0) * 1000.0
+        ids_shd, _, _ = engine_sharded.search(Q[qi], lo_raw=None, hi_raw=None, k=k, ef=ef)
+        t_shd = (time.perf_counter() - t0) * 1000.0
+
+        # Hilbert unconstrained
+        comm.Barrier()
+        t0 = time.perf_counter()
+        ids_hil, _, _ = engine_hilbert.search(Q[qi], lo_raw=None, hi_raw=None, k=k, ef=ef)
+        t_hil = (time.perf_counter() - t0) * 1000.0
 
         if rank == 0:
-            uncons_recalls.append(calc_recall(global_ids, truth))
-            uncons_lats.append(t_total_ms)
-            uncons_nets.append(stats["bcast_time_ms"] + stats["gather_time_ms"])
+            r_shd_u.append(calc_recall(ids_shd, truth))
+            lat_shd_u.append(t_shd)
+            r_hil_u.append(calc_recall(ids_hil, truth))
+            lat_hil_u.append(t_hil)
 
     if rank == 0:
-        print(f"    Recall@10: {np.mean(uncons_recalls):.3f}")
-        print(f"    Total Latency: {np.mean(uncons_lats):.2f}ms | Max Worker Compute: {np.mean(uncons_lats) - np.mean(uncons_nets):.2f}ms")
-        print(f"    MPI Network Overhead (Bcast + Gather): {np.mean(uncons_nets):.3f}ms (< 1% of total time)")
-        print("\n" + "=" * 105)
-        print("Distributed MPI Benchmark Completed Successfully!")
-        print("=" * 105)
+        print(f"    Traditional Sharded HNSW : Recall@10 = {np.mean(r_shd_u):.3f} | Latency = {np.mean(lat_shd_u):.2f}ms")
+        print(f"    Distributed Hilbert B-Tree: Recall@10 = {np.mean(r_hil_u):.3f} | Latency = {np.mean(lat_hil_u):.2f}ms")
+        print("\n" + "=" * 115)
+        print("Distributed Comparative Benchmark Completed Successfully!")
+        print("=" * 115)
 
 
 if __name__ == "__main__":
