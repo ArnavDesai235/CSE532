@@ -13,11 +13,115 @@ Key Architectural Components:
   6. HilbertHNSWEngine: Unified query optimizer and execution engine.
 """
 
+import concurrent.futures
 import heapq
+import os
+import threading
 import time
 import numpy as np
 import faiss
 from hilbertcurve.hilbertcurve import HilbertCurve
+
+
+class SharedSearchState:
+    """Thread-safe shared candidate tracker with dual branch-and-bound thresholds:
+
+      1. worst_dist_k: Distance of the k-th best candidate globally. Used for exact leaf-level
+         centroid bounding hypersphere pruning and SIMD flat scan thresholding.
+      2. worst_dist_ef: Distance of the ef-th best candidate globally. Used for HNSW beam search
+         waypoint exploration, preserving full beam width (ef) while pruning unpromising paths.
+    """
+
+    def __init__(self, k, ef=64):
+        self.k = k
+        self.ef = max(k, ef)
+        self.lock = threading.Lock()
+        self.heap = []  # max-heap storing up to self.ef entries: (-dist, gid)
+        self.seen_gids = set()
+        self.worst_dist_k = float("inf")
+        self.worst_dist_ef = float("inf")
+        self.early_exits = 0
+
+    def get_bound(self):
+        """Returns the k-th best distance bound (for leaf centroid and scan pruning)."""
+        return self.worst_dist_k
+
+    def get_ef_bound(self):
+        """Returns the ef-th best distance bound (for HNSW beam search traversal)."""
+        return self.worst_dist_ef
+
+    def is_full(self):
+        """Returns True if at least k candidates have been found."""
+        return len(self.heap) >= self.k
+
+    def is_ef_full(self):
+        """Returns True if the beam capacity ef has been filled."""
+        return len(self.heap) >= self.ef
+
+    def _recalc_bounds_locked(self):
+        if len(self.heap) >= self.ef:
+            self.worst_dist_ef = -self.heap[0][0]
+        else:
+            self.worst_dist_ef = float("inf")
+
+        if len(self.heap) >= self.k:
+            dists = sorted(-item[0] for item in self.heap)
+            self.worst_dist_k = dists[self.k - 1]
+        else:
+            self.worst_dist_k = float("inf")
+
+    def update(self, gid, dist):
+        """Inserts candidate (gid, dist) if it beats worst_dist_ef."""
+        dist = float(dist)
+        gid = int(gid)
+        if dist >= self.worst_dist_ef and len(self.heap) >= self.ef:
+            return False
+        with self.lock:
+            if dist >= self.worst_dist_ef and len(self.heap) >= self.ef:
+                return False
+            if gid in self.seen_gids:
+                return False
+            self.seen_gids.add(gid)
+            if len(self.heap) < self.ef:
+                heapq.heappush(self.heap, (-dist, gid))
+            else:
+                heapq.heappushpop(self.heap, (-dist, gid))
+            self._recalc_bounds_locked()
+            return True
+
+    def update_batch(self, gids, dists):
+        """Inserts a batch of candidates under a single lock acquisition."""
+        if len(gids) == 0:
+            return
+        with self.lock:
+            modified = False
+            for gid, d in zip(gids, dists):
+                d = float(d)
+                gid = int(gid)
+                if gid in self.seen_gids:
+                    continue
+                if len(self.heap) < self.ef:
+                    self.seen_gids.add(gid)
+                    heapq.heappush(self.heap, (-d, gid))
+                    modified = True
+                elif d < self.worst_dist_ef:
+                    self.seen_gids.add(gid)
+                    heapq.heappushpop(self.heap, (-d, gid))
+                    modified = True
+            if modified:
+                self._recalc_bounds_locked()
+
+    def record_early_exit(self):
+        with self.lock:
+            self.early_exits += 1
+
+    def get_results(self):
+        """Returns sorted (global_ids, dists) of the top-k candidates."""
+        with self.lock:
+            res = sorted((-d, gid) for d, gid in self.heap)[:self.k]
+        out_ids = np.array([gid for _, gid in res], dtype=np.int64)
+        out_dists = np.array([d for d, _ in res], dtype=np.float32)
+        return out_ids, out_dists
 
 
 class HilbertSpace:
@@ -139,13 +243,18 @@ class LeafSubgraph:
         self.order = np.argsort(self.keys, kind="stable")
         self.skeys = self.keys[self.order]
 
-        # Bounding box in raw attribute space for fast zone pruning
+        # Bounding box in raw attribute space for fast zone pruning & bounding hypersphere for branch-and-bound
         if self.n > 0:
             self.attr_min = self.A.min(axis=0)
             self.attr_max = self.A.max(axis=0)
+            self.centroid = np.mean(self.X, axis=0).astype(np.float32)
+            diff = self.X - self.centroid
+            self.radius = float(np.sqrt(np.max(np.sum(diff * diff, axis=-1))))
         else:
             self.attr_min = np.zeros(self.A.shape[1] if self.A.ndim > 1 else 1)
             self.attr_max = np.zeros_like(self.attr_min)
+            self.centroid = np.zeros(self.d, dtype=np.float32)
+            self.radius = 0.0
 
         # Build dedicated local HNSW graph
         self._build_hnsw()
@@ -191,32 +300,78 @@ class LeafSubgraph:
         valid_mask = np.all((aq >= lo_q) & (aq <= hi_q), axis=1)
         return cands[valid_mask]
 
-    def search_unconstrained(self, q, k=10, ef=64):
+    def search_unconstrained(self, q, k=10, ef=64, shared_state=None):
         """Mode 1: Pure Vanilla Unconstrained HNSW (0% filtering overhead)."""
         if self.n == 0 or self.index is None:
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32), 0
+
+        # Branch-and-bound centroid check against shared state
+        if shared_state is not None and shared_state.is_full():
+            dist_to_c = float(np.linalg.norm(q - self.centroid))
+            min_dist_to_leaf = max(0.0, dist_to_c - self.radius)
+            if (min_dist_to_leaf * min_dist_to_leaf) >= shared_state.get_bound():
+                shared_state.record_early_exit()
+                return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32), 1
+
         actual_k = min(k, self.n)
         self.index.hnsw.efSearch = max(ef, actual_k)
         D, I = self.index.search(q[None], actual_k)
         valid_idx = I[0] >= 0
         local_res = I[0][valid_idx]
-        dists = D[0][valid_idx]
+        dists = D[0][valid_idx].astype(np.float32)
+        gids = self.global_ids[local_res]
         ndis = self.index.hnsw.efSearch * 2
-        return self.global_ids[local_res], dists.astype(np.float32), ndis
 
-    def search_scan(self, q, matching_local_ids, k=10):
+        if shared_state is not None:
+            shared_state.update_batch(gids, dists)
+
+        return gids, dists, ndis
+
+    def search_scan(self, q, matching_local_ids, k=10, shared_state=None):
         """Mode 2: Contiguous SIMD Flat Scan over matching slice."""
         if len(matching_local_ids) == 0:
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32), 0
-        d = self.dist(q, matching_local_ids)
-        top = np.argsort(d)[:k]
-        top_ids = matching_local_ids[top]
-        return self.global_ids[top_ids], d[top].astype(np.float32), len(matching_local_ids)
 
-    def search_seeded_hnsw(self, q, matching_local_ids, k=10, ef=64, n_seeds=8, seed_budget=64, nav_seeds=4):
+        # Branch-and-bound centroid check against shared state
+        if shared_state is not None and shared_state.is_full():
+            dist_to_c = float(np.linalg.norm(q - self.centroid))
+            min_dist_to_leaf = max(0.0, dist_to_c - self.radius)
+            if (min_dist_to_leaf * min_dist_to_leaf) >= shared_state.get_bound():
+                shared_state.record_early_exit()
+                return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32), 1
+
+        d = self.dist(q, matching_local_ids)
+        if shared_state is not None and shared_state.is_full():
+            bound = shared_state.get_bound()
+            mask = d < bound
+            if not np.any(mask):
+                shared_state.record_early_exit()
+                return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32), len(matching_local_ids)
+            valid_indices = np.where(mask)[0]
+            sub_d = d[valid_indices]
+            top = valid_indices[np.argsort(sub_d)[:k]]
+        else:
+            top = np.argsort(d)[:k]
+
+        top_ids = matching_local_ids[top]
+        top_dists = d[top].astype(np.float32)
+        top_gids = self.global_ids[top_ids]
+        if shared_state is not None:
+            shared_state.update_batch(top_gids, top_dists)
+        return top_gids, top_dists, len(matching_local_ids)
+
+    def search_seeded_hnsw(self, q, matching_local_ids, k=10, ef=64, n_seeds=8, seed_budget=64, nav_seeds=4, shared_state=None):
         """Mode 3: Hilbert-Seeded HNSW Traversal with 2-hop navigation for boundary leaves."""
         if len(matching_local_ids) == 0:
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32), 0
+
+        # Branch-and-bound centroid check against shared state
+        if shared_state is not None and shared_state.is_full():
+            dist_to_c = float(np.linalg.norm(q - self.centroid))
+            min_dist_to_leaf = max(0.0, dist_to_c - self.radius)
+            if (min_dist_to_leaf * min_dist_to_leaf) >= shared_state.get_bound():
+                shared_state.record_early_exit()
+                return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32), 1
 
         valid_mask = np.zeros(self.n, dtype=bool)
         valid_mask[matching_local_ids] = True
@@ -250,10 +405,23 @@ class LeafSubgraph:
         while len(res) > ef:
             heapq.heappop(res)
 
+        # Update shared state with initial valid seeds
+        if shared_state is not None and res:
+            for neg_d, i in res:
+                shared_state.update(self.global_ids[i], -neg_d)
+
+        early_exited = False
         while cand:
             d, u = heapq.heappop(cand)
-            if len(res) >= ef and d > -res[0][0]:
+
+            local_worst = -res[0][0] if len(res) >= ef else np.inf
+            ef_bound = shared_state.get_ef_bound() if (shared_state is not None and shared_state.is_ef_full()) else np.inf
+
+            if (len(res) >= ef and d > local_worst) or (d > ef_bound):
+                if d > ef_bound and (shared_state is not None and shared_state.is_ef_full()):
+                    early_exited = True
                 break
+
             nb = self.nbrs[self.offs[u]: self.offs[u] + self.nb0]
             nb = nb[nb >= 0]
 
@@ -270,21 +438,36 @@ class LeafSubgraph:
             visited[nb] = True
             dn = self.dist(q, nb)
             ndis_total += nb.size
-            worst = -res[0][0] if len(res) >= ef else np.inf
+
+            local_worst = -res[0][0] if len(res) >= ef else np.inf
+            ef_bound = shared_state.get_ef_bound() if (shared_state is not None and shared_state.is_ef_full()) else np.inf
+            effective_bound = min(local_worst, ef_bound)
+
             for dv, v in zip(dn, nb):
-                if dv < worst:
+                if dv < effective_bound:
                     heapq.heappush(cand, (float(dv), int(v)))
                     if valid_mask[v]:
                         heapq.heappush(res, (-float(dv), int(v)))
                         if len(res) > ef:
                             heapq.heappop(res)
-                        worst = -res[0][0] if len(res) >= ef else np.inf
+                        local_worst = -res[0][0] if len(res) >= ef else np.inf
+                        if shared_state is not None:
+                            shared_state.update(self.global_ids[v], dv)
+                            if shared_state.is_ef_full():
+                                ef_bound = shared_state.get_ef_bound()
+                        effective_bound = min(local_worst, ef_bound)
+
+        if early_exited and shared_state is not None:
+            shared_state.record_early_exit()
 
         # res stores (-dist, i) -> extract positive distances!
         out = sorted((-neg_d, i) for neg_d, i in res)[:k]
         top_local = np.array([i for _, i in out], dtype=np.int64)
         top_dists = np.array([dist for dist, _ in out], dtype=np.float32)
-        return self.global_ids[top_local], top_dists, ndis_total
+        top_gids = self.global_ids[top_local]
+        if shared_state is not None and len(top_gids) > 0:
+            shared_state.update_batch(top_gids, top_dists)
+        return top_gids, top_dists, ndis_total
 
 
 class HilbertBTreeRouter:
@@ -422,13 +605,18 @@ class HilbertHNSWEngine:
     """The Complete Hilbert-Partitioned B-Tree Vector Engine."""
 
     def __init__(self, X, A, p=10, max_leaf_size=10000, buf_capacity=2000,
-                 M_min=12, M_max=32, M_base=20, scan_threshold=300):
+                 M_min=12, M_max=32, M_base=20, scan_threshold=300, num_threads=None):
         self.n, self.d = X.shape
         self.m = A.shape[1]
         self.p = p
         self.max_leaf_size = max_leaf_size
         self.buf_capacity = buf_capacity
         self.scan_threshold = scan_threshold
+        if num_threads is None:
+            self.num_threads = min(8, os.cpu_count() or 4)
+        else:
+            self.num_threads = max(1, num_threads)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.num_threads)
 
         amin = A.min(axis=0)
         amax = A.max(axis=0)
@@ -441,6 +629,21 @@ class HilbertHNSWEngine:
                                      max_leaf_size=max_leaf_size, buf_capacity=buf_capacity)
 
         self._bulk_load(X, A)
+
+    def close(self):
+        """Shuts down the internal ThreadPoolExecutor."""
+        if hasattr(self, "executor") and self.executor is not None:
+            self.executor.shutdown(wait=False)
+            self.executor = None
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def _bulk_load(self, X, A):
         """Initial bulk partitioning along Hilbert space."""
@@ -474,33 +677,54 @@ class HilbertHNSWEngine:
     def flush(self):
         self.buffer.flush()
 
-    def search(self, q, lo_raw=None, hi_raw=None, k=10, ef=64):
+    def search(self, q, lo_raw=None, hi_raw=None, k=10, ef=64, parallel=True):
         """Cost-based adaptive search supporting:
 
           1. Pure Unconstrained ANN (Bypass with Shared Top-K Bound).
           2. Zero-Filter Vanilla HNSW on fully enclosed leaves.
           3. SIMD Scan on small boundary slices.
           4. Hilbert-Seeded 2-hop HNSW on large boundary slices.
+          5. Parallel multi-subgraph execution with shared-state branch-and-bound early exit.
         """
-        q = np.asarray(q, dtype=np.float32)
-        stats = {"ndis": 0, "enclosed_leaves": 0, "boundary_leaves": 0, "pruned_leaves": 0, "mode": "hybrid"}
+        q = np.asarray(q, dtype=np.float32).ravel()
+        stats = {
+            "ndis": 0,
+            "enclosed_leaves": 0,
+            "boundary_leaves": 0,
+            "pruned_leaves": 0,
+            "early_exits": 0,
+            "parallel": parallel and (self.num_threads > 1),
+            "mode": "hybrid",
+        }
 
         self.flush()
+        shared_state = SharedSearchState(k=k, ef=ef)
+        use_parallel = parallel and (self.num_threads > 1) and (self.executor is not None)
 
         # Fast Path 1: Pure Unconstrained ANN Search
         if lo_raw is None or hi_raw is None:
             stats["mode"] = "unconstrained"
-            heap = []
+            leaf_tasks = []
             for leaf in self.router.leaves:
-                ids, dists, nd = leaf.search_unconstrained(q, k=k, ef=ef)
-                stats["ndis"] += nd
-                for gid, d in zip(ids, dists):
-                    if len(heap) < k:
-                        heapq.heappush(heap, (-float(d), int(gid)))
-                    elif d < -heap[0][0]:
-                        heapq.heappushpop(heap, (-float(d), int(gid)))
-            res = sorted((-d, gid) for d, gid in heap)
-            return np.array([gid for _, gid in res], dtype=np.int64), stats
+                dist_to_c = float(np.linalg.norm(q - leaf.centroid))
+                min_dist = max(0.0, dist_to_c - leaf.radius)
+                leaf_tasks.append((min_dist, leaf))
+            leaf_tasks.sort(key=lambda t: t[0])
+
+            def _search_unconstrained_task(leaf):
+                ids, dists, nd = leaf.search_unconstrained(q, k=k, ef=ef, shared_state=shared_state)
+                return nd
+
+            if use_parallel and len(leaf_tasks) > 1:
+                futures = [self.executor.submit(_search_unconstrained_task, leaf) for _, leaf in leaf_tasks]
+                total_ndis = sum(f.result() for f in concurrent.futures.as_completed(futures))
+            else:
+                total_ndis = sum(_search_unconstrained_task(leaf) for _, leaf in leaf_tasks)
+
+            stats["ndis"] = total_ndis
+            stats["early_exits"] = shared_state.early_exits
+            out_ids, _ = shared_state.get_results()
+            return out_ids, stats
 
         # Filtered Path: Zone Map & Range decomposition routing
         intervals = self.space.decompose(lo_raw, hi_raw, max_depth=6)
@@ -509,34 +733,47 @@ class HilbertHNSWEngine:
         stats["boundary_leaves"] = len(boundary_leaves)
         stats["pruned_leaves"] = len(self.router.leaves) - (len(enclosed_leaves) + len(boundary_leaves))
 
-        heap = []
-
-        # 1. Search fully enclosed leaves with ZERO filter overhead (Pure Vanilla HNSW)
+        tasks = []
         for leaf in enclosed_leaves:
-            ids, dists, nd = leaf.search_unconstrained(q, k=k, ef=ef)
-            stats["ndis"] += nd
-            for gid, d in zip(ids, dists):
-                if len(heap) < k:
-                    heapq.heappush(heap, (-float(d), int(gid)))
-                elif d < -heap[0][0]:
-                    heapq.heappushpop(heap, (-float(d), int(gid)))
+            dist_to_c = float(np.linalg.norm(q - leaf.centroid))
+            min_dist = max(0.0, dist_to_c - leaf.radius)
+            tasks.append((min_dist, leaf, "enclosed"))
 
-        # 2. Search boundary leaves (Scan or Hilbert-Seeded HNSW)
         for leaf in boundary_leaves:
-            matching_ids = leaf.find_matching_local(intervals, lo_raw, hi_raw, self.space)
-            if len(matching_ids) == 0:
-                continue
-            if len(matching_ids) <= self.scan_threshold:
-                ids, dists, nd = leaf.search_scan(q, matching_ids, k=k)
-            else:
-                ids, dists, nd = leaf.search_seeded_hnsw(q, matching_ids, k=k, ef=ef)
-            stats["ndis"] += nd
-            for gid, d in zip(ids, dists):
-                if len(heap) < k:
-                    heapq.heappush(heap, (-float(d), int(gid)))
-                elif d < -heap[0][0]:
-                    heapq.heappushpop(heap, (-float(d), int(gid)))
+            dist_to_c = float(np.linalg.norm(q - leaf.centroid))
+            min_dist = max(0.0, dist_to_c - leaf.radius)
+            tasks.append((min_dist, leaf, "boundary"))
 
-        res = sorted((-d, gid) for d, gid in heap)
-        out_ids = np.array([gid for _, gid in res], dtype=np.int64)
+        tasks.sort(key=lambda t: t[0])
+
+        def _execute_filtered_task(task_tuple):
+            _, leaf, kind = task_tuple
+            if kind == "enclosed":
+                ids, dists, nd = leaf.search_unconstrained(q, k=k, ef=ef, shared_state=shared_state)
+                return nd
+            else:  # boundary
+                if shared_state.is_full():
+                    dist_to_c = float(np.linalg.norm(q - leaf.centroid))
+                    min_dist_to_leaf = max(0.0, dist_to_c - leaf.radius)
+                    if (min_dist_to_leaf * min_dist_to_leaf) >= shared_state.get_bound():
+                        shared_state.record_early_exit()
+                        return 1
+                matching_ids = leaf.find_matching_local(intervals, lo_raw, hi_raw, self.space)
+                if len(matching_ids) == 0:
+                    return 0
+                if len(matching_ids) <= self.scan_threshold:
+                    ids, dists, nd = leaf.search_scan(q, matching_ids, k=k, shared_state=shared_state)
+                else:
+                    ids, dists, nd = leaf.search_seeded_hnsw(q, matching_ids, k=k, ef=ef, shared_state=shared_state)
+                return nd
+
+        if use_parallel and len(tasks) > 1:
+            futures = [self.executor.submit(_execute_filtered_task, t) for t in tasks]
+            total_ndis = sum(f.result() for f in concurrent.futures.as_completed(futures))
+        else:
+            total_ndis = sum(_execute_filtered_task(t) for t in tasks)
+
+        stats["ndis"] = total_ndis
+        stats["early_exits"] = shared_state.early_exits
+        out_ids, _ = shared_state.get_results()
         return out_ids, stats
