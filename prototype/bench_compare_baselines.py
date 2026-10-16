@@ -36,12 +36,24 @@ def run_comparison():
     print("=" * 110)
 
     corr = "--corr" in sys.argv
-    X = rng.standard_normal((n, d)).astype("float32")
-    if corr:
+    clusters = "--clusters" in sys.argv
+    if clusters:
+        X = np.empty((n, d), dtype=np.float32)
+        A = np.empty((n, 2), dtype=np.float32)
+        X[:10000] = rng.normal(loc=0.0, scale=0.1, size=(10000, d))
+        A[:10000] = rng.uniform(0.0, 0.25, size=(10000, 2))
+        X[10000:25000] = rng.normal(loc=2.0, scale=1.0, size=(15000, d))
+        A[10000:25000] = rng.uniform(0.25, 0.6, size=(15000, 2))
+        X[25000:] = rng.normal(loc=5.0, scale=3.0, size=(15000, d))
+        A[25000:] = rng.uniform(0.6, 1.0, size=(15000, 2))
+        print("Attribute Distribution: MULTI-DENSITY CLUSTERED vector space (dense vs sparse partitions)")
+    elif corr:
+        X = rng.standard_normal((n, d)).astype("float32")
         A = X[:, :2] + 0.4 * rng.standard_normal((n, 2))
         A = (A - A.min(0)) / (A.max(0) - A.min(0))
         print("Attribute Distribution: CORRELATED with vector embedding space")
     else:
+        X = rng.standard_normal((n, d)).astype("float32")
         A = rng.random((n, 2)).astype("float32")
         print("Attribute Distribution: INDEPENDENT uniform attributes")
 
@@ -73,6 +85,32 @@ def run_comparison():
     degrees = [leaf.M for leaf in engine.router.leaves]
     print(f"    Built {num_leaves} partitioned leaf subgraphs in {btree_build_time:.2f}s")
     print(f"    Adaptive Sparsity Degrees across leaves: {degrees}")
+
+    # 3. Memory Footprint Comparison: Full KNN Graph vs. Hilbert Subgraphs
+    print("\n[3] Memory Footprint Comparison: Full KNN Graph vs. Hilbert B-Tree Subgraphs:")
+    print(f"{'Component':<36} | {'Traditional HNSW':>18} | {'Hilbert B-Tree':>18} | {'Difference':>15}")
+    print("-" * 95)
+
+    trad_bytes = len(faiss.serialize_index(trad_index))
+    trad_vec_bytes = n * d * 4
+    trad_graph_bytes = trad_bytes - trad_vec_bytes
+    trad_attr_bytes = A.nbytes  # external attribute storage required for filtering
+
+    btree_mem = engine.get_memory_footprint()
+    btree_total_bytes = btree_mem["total_bytes"]
+    btree_graph_bytes = btree_mem["pure_graph_bytes"]
+    btree_vec_bytes = btree_mem["vector_bytes"]
+    btree_aux_bytes = btree_mem["attr_bytes"] + btree_mem["key_bytes"] + btree_mem["id_bytes"] + btree_mem["meta_bytes"]
+
+    def mb(b):
+        return f"{b / (1024 * 1024):.2f} MB"
+
+    print(f"{'Raw Vector Storage (float32)':<36} | {mb(trad_vec_bytes):>18} | {mb(btree_vec_bytes):>18} | {mb(btree_vec_bytes - trad_vec_bytes):>15}")
+    print(f"{'Graph Index Edges (HNSW Links)':<36} | {mb(trad_graph_bytes):>18} | {mb(btree_graph_bytes):>18} | {mb(btree_graph_bytes - trad_graph_bytes):>15}")
+    print(f"{'Auxiliary Data (Attrs, Keys, IDs)':<36} | {mb(trad_attr_bytes):>18} | {mb(btree_aux_bytes):>18} | {mb(btree_aux_bytes - trad_attr_bytes):>15}")
+    print("-" * 95)
+    print(f"{'Total Memory Footprint':<36} | {mb(trad_bytes + trad_attr_bytes):>18} | {mb(btree_total_bytes):>18} | {mb(btree_total_bytes - (trad_bytes + trad_attr_bytes)):>15}")
+    print(f"{'Bytes per Vector':<36} | {(trad_bytes + trad_attr_bytes) / n:>16.1f} B | {btree_total_bytes / n:>16.1f} B | {(btree_total_bytes - (trad_bytes + trad_attr_bytes)) / n:>13.1f} B")
 
     def calc_recall(found, truth):
         if len(truth) == 0:
@@ -141,8 +179,8 @@ def run_comparison():
         top = np.argsort(d)[:k]
         return valid_gids[top], len(valid_gids)
 
-    # 3. Direct Head-to-Head Latency & Recall Comparison
-    print("\n[3] Single-Query Latency & Recall Comparison across Selectivity Spectrum:")
+    # 4. Direct Head-to-Head Latency & Recall Comparison
+    print("\n[4] Single-Query Latency & Recall Comparison across Selectivity Spectrum:")
     header = (f"{'Sel':>6} | "
               f"{'Trad. Post (Rec / Lat)':>23} | "
               f"{'Trad. Beam (Rec / Lat / Dist)':>29} | "
@@ -214,8 +252,8 @@ def run_comparison():
 
         print(f"{sel:>6.3f} | {post_str:>23} | {beam_str:>29} | {scan_str:>23} | {btree_str:>33}")
 
-    # 4. Multi-Threaded Concurrent Query Workload (16-thread pool across cores)
-    print(f"\n[4] Multi-Core Concurrent Batch Workload Evaluation ({num_cpus} Worker Threads):")
+    # 5. Multi-Threaded Concurrent Query Workload (16-thread pool across cores)
+    print(f"\n[5] Multi-Core Concurrent Batch Workload Evaluation ({num_cpus} Worker Threads):")
     batch_header = (f"{'Sel':>6} | "
                     f"{'Trad. Beam (Time / QPS)':>25} | "
                     f"{'Exact Scan (Time / QPS)':>25} | "
@@ -263,8 +301,8 @@ def run_comparison():
 
         print(f"{sel:>6.3f} | {beam_batch_str:>25} | {scan_batch_str:>25} | {btree_batch_str:>27} | {speedup_str:>18}")
 
-    # 5. Ingestion / Streaming Maintenance Comparison
-    print("\n[5] Streaming Appends Maintenance Cost (8,000 Vectors Ingestion):")
+    # 6. Ingestion / Streaming Maintenance Comparison
+    print("\n[6] Streaming Appends Maintenance Cost (8,000 Vectors Ingestion):")
     n_appends = 8_000
     X_new = rng.standard_normal((n_appends, d)).astype("float32")
     A_new = rng.random((n_appends, 2)).astype("float32")

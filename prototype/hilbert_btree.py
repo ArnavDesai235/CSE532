@@ -271,6 +271,26 @@ class LeafSubgraph:
         self.offs = faiss.vector_to_array(h.offsets)
         self.nb0 = h.nb_neighbors(0)
 
+    def get_memory_bytes(self):
+        """Returns detailed memory breakdown in bytes for this leaf partition."""
+        faiss_bytes = len(faiss.serialize_index(self.index)) if self.index is not None else 0
+        raw_vec_bytes = self.X.nbytes
+        attr_bytes = self.A.nbytes
+        key_bytes = self.keys.nbytes + self.skeys.nbytes + self.order.nbytes
+        id_bytes = self.global_ids.nbytes
+        meta_bytes = self.attr_min.nbytes + self.attr_max.nbytes + self.centroid.nbytes + 8
+        pure_graph_bytes = max(0, faiss_bytes - raw_vec_bytes)
+        return {
+            "faiss_total": faiss_bytes,
+            "pure_graph_bytes": pure_graph_bytes,
+            "vector_bytes": raw_vec_bytes,
+            "attr_bytes": attr_bytes,
+            "key_bytes": key_bytes,
+            "id_bytes": id_bytes,
+            "meta_bytes": meta_bytes,
+            "total_bytes": faiss_bytes + attr_bytes + key_bytes + id_bytes + meta_bytes,
+        }
+
     def dist(self, q, local_ids):
         """Computes squared L2 distances from query q to local indices."""
         diff = self.X[local_ids] - q
@@ -676,6 +696,33 @@ class HilbertHNSWEngine:
 
     def flush(self):
         self.buffer.flush()
+
+    def get_memory_footprint(self):
+        """Returns memory footprint breakdown across all leaf subgraphs and router."""
+        self.flush()
+        leaf_stats = [leaf.get_memory_bytes() for leaf in self.router.leaves]
+        total_faiss = sum(s["faiss_total"] for s in leaf_stats)
+        pure_graph = sum(s["pure_graph_bytes"] for s in leaf_stats)
+        vec_bytes = sum(s["vector_bytes"] for s in leaf_stats)
+        attr_bytes = sum(s["attr_bytes"] for s in leaf_stats)
+        key_bytes = sum(s["key_bytes"] for s in leaf_stats)
+        id_bytes = sum(s["id_bytes"] for s in leaf_stats)
+        meta_bytes = sum(s["meta_bytes"] for s in leaf_stats)
+        total_bytes = sum(s["total_bytes"] for s in leaf_stats)
+        return {
+            "num_leaves": len(self.router.leaves),
+            "faiss_total_bytes": total_faiss,
+            "pure_graph_bytes": pure_graph,
+            "vector_bytes": vec_bytes,
+            "attr_bytes": attr_bytes,
+            "key_bytes": key_bytes,
+            "id_bytes": id_bytes,
+            "meta_bytes": meta_bytes,
+            "total_bytes": total_bytes,
+            "faiss_mb": total_faiss / (1024 * 1024),
+            "pure_graph_mb": pure_graph / (1024 * 1024),
+            "total_mb": total_bytes / (1024 * 1024),
+        }
 
     def search(self, q, lo_raw=None, hi_raw=None, k=10, ef=64, parallel=True):
         """Cost-based adaptive search supporting:
