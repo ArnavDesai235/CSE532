@@ -204,18 +204,61 @@ class MapReduceCollation:
         return all_ids[sorted_sub], all_dists[sorted_sub]
 
 
-class HilbertSpace:
-    """Handles m-dimensional scalar attribute quantization and Hilbert curve decomposition."""
+def interleave_subspace_keys(keys_list, bits=16):
+    """Bit-interleaves S subspace Hilbert keys into a single uint64 master clustering key."""
+    S = len(keys_list)
+    if S == 1:
+        return np.asarray(keys_list[0], dtype=np.uint64)
+    n = len(keys_list[0])
+    res = np.zeros(n, dtype=np.uint64)
+    for bit_idx in range(bits):
+        for s_idx in range(S):
+            b = (np.uint64(keys_list[s_idx]) >> np.uint64(bit_idx)) & np.uint64(1)
+            target_shift = np.uint64(bit_idx * S + s_idx)
+            if target_shift < 64:
+                res |= (b << target_shift)
+    return res
 
-    def __init__(self, amin, amax, p=10, m=2):
+
+def deinterleave_subspace_keys(master_keys, S, bits=16):
+    """Recovers the S subspace Hilbert keys from the interleaved master key."""
+    master_keys = np.asarray(master_keys, dtype=np.uint64)
+    out = [np.zeros_like(master_keys) for _ in range(S)]
+    for bit_idx in range(bits):
+        for s_idx in range(S):
+            src_shift = np.uint64(bit_idx * S + s_idx)
+            if src_shift < 64:
+                b = (master_keys >> src_shift) & np.uint64(1)
+                out[s_idx] |= (b << np.uint64(bit_idx))
+    return out
+
+
+class HilbertSpace:
+    """Handles m-dimensional scalar attribute quantization and Subspace Hilbert curve bit-interleaving."""
+
+    def __init__(self, amin, amax, p=10, m=2, subspace_dim=2, subspaces=None):
         self.p = p
         self.m = m
-        assert self.m * self.p <= 63, "Total key bits (m * p) must fit in uint64"
         self.amin = np.asarray(amin, dtype=np.float64)
         self.amax = np.asarray(amax, dtype=np.float64)
         self.span = np.where(self.amax > self.amin, self.amax - self.amin, 1.0)
-        self.hc = HilbertCurve(p, m)
-        self.max_key = np.uint64((1 << (m * p)) - 1)
+
+        # Configure subspaces: group attributes into low-dimensional subspaces (default 2D pairs)
+        if subspaces is not None:
+            self.subspaces = [list(s) for s in subspaces]
+        elif m <= subspace_dim:
+            self.subspaces = [list(range(m))]
+        else:
+            self.subspaces = [list(range(i, min(i + subspace_dim, m))) for i in range(0, m, subspace_dim)]
+
+        self.S = len(self.subspaces)
+        self.sub_dims = [len(s) for s in self.subspaces]
+        total_bits = sum(d * self.p for d in self.sub_dims)
+        assert total_bits <= 63, f"Total key bits ({total_bits}) must fit in uint64 (<= 63 bits)"
+
+        self.curves = [HilbertCurve(p, d) for d in self.sub_dims]
+        self.bits_per_sub = self.p * max(self.sub_dims)
+        self.max_key = np.uint64((1 << total_bits) - 1)
 
     def quantize(self, A):
         """Maps continuous attributes to the p-bit integer grid [0, 2^p - 1]."""
@@ -224,16 +267,26 @@ class HilbertSpace:
         return np.clip(q, 0, 2**self.p - 1).astype(np.int64)
 
     def points_to_keys(self, Aq):
-        """Converts quantized points to 1D uint64 Hilbert distance keys."""
+        """Converts quantized points to 1D uint64 bit-interleaved Subspace Hilbert keys."""
+        Aq = np.asarray(Aq, dtype=np.int64)
         if len(Aq) == 0:
             return np.empty(0, dtype=np.uint64)
-        keys = self.hc.distances_from_points(Aq.tolist())
-        return np.array(keys, dtype=np.uint64)
+
+        if self.S == 1:
+            keys = self.curves[0].distances_from_points(Aq.tolist())
+            return np.array(keys, dtype=np.uint64)
+
+        sub_keys = []
+        for s_idx, dims in enumerate(self.subspaces):
+            sub_pts = Aq[:, dims]
+            k = self.curves[s_idx].distances_from_points(sub_pts.tolist())
+            sub_keys.append(np.array(k, dtype=np.uint64))
+
+        return interleave_subspace_keys(sub_keys, bits=self.bits_per_sub)
 
     def decompose(self, lo_raw, hi_raw, max_depth=6):
         """Decomposes an m-dimensional bounding box [lo_raw, hi_raw] into disjoint
-
-        merged 1D Hilbert key intervals [start, end).
+        merged 1D bit-interleaved Hilbert key intervals [start, end).
         """
         lo = self.quantize(lo_raw)
         hi = self.quantize(hi_raw)
@@ -247,7 +300,8 @@ class HilbertSpace:
                 return
             if (np.all(corner >= lo) and np.all(cmax <= hi)) or level == max_depth:
                 size = 1 << (self.m * (self.p - level))
-                start = (self.hc.distance_from_point(corner.tolist()) // size) * size
+                ck = self.points_to_keys(corner[None])[0]
+                start = (ck // size) * size
                 out.append((start, start + size))
                 return
             half = side >> 1
@@ -705,7 +759,8 @@ class HilbertHNSWEngine:
     """The Complete Hilbert-Partitioned B-Tree Vector Engine."""
 
     def __init__(self, X, A, p=10, max_leaf_size=10000, buf_capacity=2000,
-                 M_min=12, M_max=32, M_base=20, scan_threshold=None, num_threads=None):
+                 M_min=12, M_max=32, M_base=20, scan_threshold=None, num_threads=None,
+                 subspace_dim=2, subspaces=None):
         self.n, self.d = X.shape
         self.m = A.shape[1]
         self.p = p
@@ -723,7 +778,8 @@ class HilbertHNSWEngine:
 
         amin = A.min(axis=0)
         amax = A.max(axis=0)
-        self.space = HilbertSpace(amin, amax, p=p, m=self.m)
+        self.space = HilbertSpace(amin, amax, p=p, m=self.m,
+                                  subspace_dim=subspace_dim, subspaces=subspaces)
         global_apd = GraphSparsityTuner.compute_apd(X)
         self.tuner = GraphSparsityTuner(global_apd, M_min=M_min, M_max=M_max, M_base=M_base)
 
