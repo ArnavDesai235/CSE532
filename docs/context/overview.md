@@ -41,6 +41,10 @@ attributes (categorical or numeric, e.g. `x > 30`) that are unrelated to vector 
    - **Subspace Bit-Interleaved Clustering:** We group $m$ attributes into low-dimensional orthogonal subspaces $\mathcal{S}_1, \dots, \mathcal{S}_S$ (e.g. 2D pairs $[A_0, A_1], [A_2, A_3]$). Each subspace generates an independent Hilbert key $h_s \in [0, 2^{d_s \cdot p} - 1]$. The engine bit-interleaves these subspace keys bit-by-bit into a unified 64-bit master clustering key:
      $$K_{\text{master}} = \sum_{b=0}^{p \cdot d_{\max}-1} \sum_{s=0}^{S-1} \text{bit}(h_s, b) \ll (b \cdot S + s)$$
    - **Single Leaf Set Pruning:** By interleaving bits hierarchically, the primary sorting key preserves multi-dimensional spatial locality across all subspaces simultaneously. A single physical set of leaf nodes and subgraphs supports queries filtering on Subspace 0 only, Subspace 1 only, or compound predicates across all subspaces, achieving 100% exact recall and pruning up to $5/6$ of the leaf partitions without storing duplicate datasets.
+6. **Distributed MPI & Slurm HPC Scaling:**
+   - **Range-Partitioned Distributed Curve:** Across an HPC cluster with $P$ MPI ranks (managed via Slurm `srun`), the bit-interleaved Hilbert curve is divided into contiguous segments scattered to ranks. Each rank owns a disjoint partition of the attribute space and builds independent, local L2/L3-cache-resident HNSW subgraphs.
+   - **Distributed Zone Map Pruning:** When Rank 0 broadcasts query parameters $(q, lo, hi, k, ef)$, ranks with non-intersecting local bounding boxes prune themselves locally without communicating, incurring zero distance computations and zero network chatter.
+   - **Microsecond Network Overhead:** Surviving ranks return only their local top-$k$ candidate pairs (e.g. 10 IDs + 10 floats $\approx 120\text{ bytes}$ per rank). Across 64 nodes, total gathered data is $< 8\text{ KB}$, completing across InfiniBand in $< 10\,\mu\text{s}$ before parallel reduction on Rank 0.
 
 ## Goals
 - Return the full k results with high recall across all selectivity levels, including highly selective predicates (<1%) where post-filtering starves.
@@ -48,18 +52,19 @@ attributes (categorical or numeric, e.g. `x > 30`) that are unrelated to vector 
 - Implement a temporal merging scheme that buffers appends and restricts graph rebuilds strictly to localized partition leaves.
 - Formulate a cost-based optimizer to route dynamically between SIMD flat scans and partitioned subgraph traversals.
 - Evaluate recall@k, latency, and index maintenance overhead against plain HNSW and ACORN-style filtered baselines.
+- Scale vector search across distributed compute nodes in HPC environments using MPI and Slurm.
 
 ## Scope
 **In scope**
-- Filtered k-NN queries over vectors with continuous numeric and categorical attributes ($m \le 4$)
+- Filtered k-NN queries over vectors with continuous numeric and categorical attributes ($m \le 12$)
 - Hilbert-partitioned B-tree data layout with dedicated HNSW subgraphs
 - Temporal append buffering and localized leaf compaction model
 - Selectivity estimation via Hilbert range decomposition and B-tree boundary pruning
 - Cost-based query router (SIMD scan vs. Hilbert-seeded HNSW traversal)
 - Benchmarks sweeping predicate selectivity, attribute dimension, and data correlation
+- Distributed execution via MPI (`mpi4py`) and Slurm batch submission scripts on HPC clusters
 
 **Out of scope**
-- Distributed clusters (single-node multi-threaded evaluation)
 - Complex ACID transaction concurrency (focus on read-optimized lakehouse / append-mostly workloads)
 - Arbitrary schema changes beyond defined attribute dimensions
 
