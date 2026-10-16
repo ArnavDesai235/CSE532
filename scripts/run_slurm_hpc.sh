@@ -11,12 +11,12 @@
 #SBATCH --job-name=cse532_mpi_btree
 #SBATCH --output=logs/mpi_%j.out
 #SBATCH --error=logs/mpi_%j.err
-#SBATCH --nodes=4                   # Number of cluster compute nodes
-#SBATCH --ntasks-per-node=8         # 8 MPI ranks per node (4 nodes * 8 = 32 MPI ranks)
+#SBATCH --nodes=2                   # Number of cluster compute nodes (2 nodes = 80 cores; 4 nodes = 160 cores)
+#SBATCH --ntasks-per-node=10        # 10 MPI ranks per node (10 * 4 = 40 physical cores per node)
 #SBATCH --cpus-per-task=4           # 4 CPU hardware cores per MPI rank for OpenMP/SIMD
-#SBATCH --time=01:00:00             # Wall clock execution limit (1 hour)
-#SBATCH --partition=short           # Cluster partition queue (e.g. short, debug, standard)
-#SBATCH --mem=32G                   # Physical RAM allocation per compute node
+#SBATCH --time=01:00:00             # Wall clock execution limit (1 hour; max 4h on short-40core)
+#SBATCH --partition=short-40core    # 40-core partition queue (e.g. Stony Brook SeaWulf)
+#SBATCH --mem=120G                  # RAM allocation per node (leaves headroom out of 192GB total)
 
 # Create log directory
 mkdir -p logs
