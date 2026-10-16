@@ -8,6 +8,8 @@ Tests:
   5. Pure Unconstrained ANN Search.
 """
 
+import concurrent.futures
+import os
 import sys
 import time
 import numpy as np
@@ -170,8 +172,35 @@ def run_benchmark():
     print(f"    Avg Distance Computations: {np.mean(uncons_ndis):.0f}")
     print(f"    Sequential Latency: {seq_ms:.2f}ms | Parallel Latency: {par_ms:.2f}ms (Speedup: {sp:.2f}x)")
 
-    # 6. Dynamic Streaming Appends & Localized Median Split Test
-    print("\n[5] Testing Dynamic Stream Appends & Localized Median Leaf Splitting...")
+    # 6. Multi-Core Concurrent Query Batch Throughput (Full Machine Scaling)
+    num_cpus = os.cpu_count() or 4
+    print(f"\n[5] Multi-Core Concurrent Batch Workload Evaluation ({num_cpus} Worker Threads):")
+    print(f"{'Selectivity':>12} | {'Batch Queries':>14} | {'Total Time (ms)':>16} | {'Throughput (QPS)':>18} | {'Avg Latency (ms)':>18}")
+    print("-" * 85)
+
+    for sel in [0.05, 0.10, 0.25]:
+        side = np.sqrt(sel)
+        # Prepare valid queries
+        batch_queries = []
+        for qi in range(nq):
+            c = rng.random(2) * (1.0 - side)
+            lo, hi = c, c + side
+            in_range = np.all((A >= lo) & (A <= hi), axis=1)
+            if np.sum(in_range) >= k:
+                batch_queries.append((Q[qi], lo, hi))
+
+        t0 = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_cpus) as pool:
+            futures = [pool.submit(engine.search, q, lo_raw=lo, hi_raw=hi, k=k, ef=ef, parallel=False)
+                       for q, lo, hi in batch_queries]
+            _ = [f.result() for f in futures]
+        t_batch_ms = (time.perf_counter() - t0) * 1000.0
+        qps = len(batch_queries) / (t_batch_ms / 1000.0) if t_batch_ms > 0 else 0.0
+        avg_lat = t_batch_ms / len(batch_queries) if batch_queries else 0.0
+        print(f"{sel:>12.3f} | {len(batch_queries):>14} | {t_batch_ms:>16.2f} | {qps:>18.1f} | {avg_lat:>18.2f}")
+
+    # 7. Dynamic Streaming Appends & Localized Median Split Test
+    print("\n[6] Testing Dynamic Stream Appends & Localized Median Leaf Splitting...")
     n_appends = 8_000
     print(f"    Streaming {n_appends} new vectors into Temporal Buffer (L0)...")
     X_new = rng.standard_normal((n_appends, d)).astype("float32")

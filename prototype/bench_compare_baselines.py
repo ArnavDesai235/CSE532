@@ -6,11 +6,18 @@ Baselines evaluated:
   3. Exact Linear Scan (Pre-filtered SIMD Scan): Baseline scanning only matching attribute records.
   4. Hilbert-Partitioned B-Tree (Our Approach): Zone Map leaf pruning + parallel subgraphs + shared-state early exit.
 
+Parallelism Evaluated:
+  - Intra-Query Parallelism: Hilbert B-Tree partitions search across leaf subgraphs in parallel.
+  - Multi-Threaded Batch Workload: All systems evaluated under concurrent 16-thread query execution
+    measuring full multi-core throughput (QPS) and parallel latency.
+
 Usage:
   python prototype/bench_compare_baselines.py [--corr]
 """
 
+import concurrent.futures
 import heapq
+import os
 import sys
 import time
 import numpy as np
@@ -22,10 +29,11 @@ def run_comparison():
     rng = np.random.default_rng(42)
     n, d, nq, k, ef = 40_000, 32, 50, 10, 64
     max_leaf_size = 10_000
+    num_cpus = os.cpu_count() or 4
 
-    print("=" * 95)
-    print("CSE532 Comparative Benchmark: Hilbert-Partitioned B-Tree vs. Traditional KNN Graphs")
-    print("=" * 95)
+    print("=" * 110)
+    print(f"CSE532 Comparative Benchmark: Hilbert-Partitioned B-Tree vs. Traditional KNN Graphs ({num_cpus} CPU Cores)")
+    print("=" * 110)
 
     corr = "--corr" in sys.argv
     X = rng.standard_normal((n, d)).astype("float32")
@@ -58,7 +66,8 @@ def run_comparison():
     print(f"\n[2] Building Hilbert B-Tree of Subgraphs (N={n}, d={d}, max_leaf_size={max_leaf_size})...")
     t0 = time.time()
     engine = HilbertHNSWEngine(X, A, p=10, max_leaf_size=max_leaf_size,
-                               M_min=12, M_max=32, M_base=20, scan_threshold=300)
+                               M_min=12, M_max=32, M_base=20, scan_threshold=300,
+                               num_threads=num_cpus)
     btree_build_time = time.time() - t0
     num_leaves = len(engine.router.leaves)
     degrees = [leaf.M for leaf in engine.router.leaves]
@@ -118,26 +127,45 @@ def run_comparison():
         out = sorted((-neg_d, i) for neg_d, i in res)[:k]
         return np.array([i for _, i in out], dtype=np.int64), ndis
 
-    # 3. Sweep across Selectivity
-    print("\n[3] Head-to-Head Performance Evaluation across Selectivity Spectrum:")
+    def run_post_filter(q, valid_set):
+        trad_index.hnsw.efSearch = ef
+        _, I = trad_index.search(q[None], ef)
+        matches = [i for i in I[0] if i in valid_set][:k]
+        return np.array(matches, dtype=np.int64), ef * 2
+
+    def run_simd_scan(q, valid_gids):
+        if len(valid_gids) == 0:
+            return np.empty(0, dtype=np.int64), 0
+        diff = X[valid_gids] - q
+        d = np.einsum("ij,ij->i", diff, diff)
+        top = np.argsort(d)[:k]
+        return valid_gids[top], len(valid_gids)
+
+    # 3. Direct Head-to-Head Latency & Recall Comparison
+    print("\n[3] Single-Query Latency & Recall Comparison across Selectivity Spectrum:")
     header = (f"{'Sel':>6} | "
-              f"{'Trad. Post Recall':>17} | {'Trad. Beam (Recall/Dist)':>24} | "
-              f"{'Hilbert B-Tree (Recall/Dist/Lat)':>32} | {'Scan Dist':>9}")
+              f"{'Trad. Post (Rec / Lat)':>23} | "
+              f"{'Trad. Beam (Rec / Lat / Dist)':>29} | "
+              f"{'Exact Scan (Lat / Dist)':>23} | "
+              f"{'Hilbert B-Tree (Rec / Lat / Dist)':>33}")
     print(header)
     print("-" * len(header))
 
+    query_payloads = []  # store for batch parallel evaluation
+
     for sel in [0.005, 0.02, 0.05, 0.10, 0.25]:
-        r_post = []
-        r_beam, nd_beam = [], []
-        r_btree, nd_btree, lat_btree = [], [], []
-        nd_scan = []
+        r_post, lat_post, nd_post = [], [], []
+        r_beam, lat_beam, nd_beam = [], [], []
+        r_btree, lat_btree, nd_btree = [], [], []
+        lat_scan, nd_scan = [], []
+
+        sel_queries = []
 
         for qi in range(nq):
             side = np.sqrt(sel)
             c = rng.random(2) * (1.0 - side)
             lo, hi = c, c + side
 
-            # Exact ground truth
             in_range = np.all((A >= lo) & (A <= hi), axis=1)
             valid_gids = np.where(in_range)[0]
             if len(valid_gids) < k:
@@ -148,19 +176,27 @@ def run_comparison():
             truth = valid_gids[np.argsort(true_dists)[:k]]
             valid_set = set(valid_gids.tolist())
 
+            sel_queries.append((Q[qi], lo, hi, in_range, valid_gids, valid_set, truth))
+
             # 1. Baseline: Traditional HNSW Post-Filtering
-            trad_index.hnsw.efSearch = ef
-            _, I = trad_index.search(Q[qi][None], ef)
-            post_matches = [i for i in I[0] if i in valid_set][:k]
-            r_post.append(calc_recall(np.array(post_matches), truth))
+            t0 = time.perf_counter()
+            post_matches, nd_p = run_post_filter(Q[qi], valid_set)
+            lat_post.append((time.perf_counter() - t0) * 1000.0)
+            r_post.append(calc_recall(post_matches, truth))
+            nd_post.append(nd_p)
 
             # 2. Baseline: Traditional In-Graph Filtered Beam Search
+            t0 = time.perf_counter()
             beam_ids, nd_b = traditional_filtered_beam_search(Q[qi], in_range, k=k, ef=ef)
+            lat_beam.append((time.perf_counter() - t0) * 1000.0)
             r_beam.append(calc_recall(beam_ids, truth))
             nd_beam.append(nd_b)
 
-            # 3. Baseline: Scan Cost
-            nd_scan.append(len(valid_gids))
+            # 3. Baseline: Exact SIMD Scan
+            t0 = time.perf_counter()
+            scan_ids, nd_s = run_simd_scan(Q[qi], valid_gids)
+            lat_scan.append((time.perf_counter() - t0) * 1000.0)
+            nd_scan.append(nd_s)
 
             # 4. Our Hilbert-Partitioned B-Tree Engine
             t0 = time.perf_counter()
@@ -169,20 +205,66 @@ def run_comparison():
             r_btree.append(calc_recall(btree_ids, truth))
             nd_btree.append(stats["ndis"])
 
-        avg_post = np.mean(r_post) if r_post else 0.0
-        avg_r_beam = np.mean(r_beam) if r_beam else 0.0
-        avg_nd_beam = np.mean(nd_beam) if nd_beam else 0.0
-        avg_r_btree = np.mean(r_btree) if r_btree else 0.0
-        avg_nd_btree = np.mean(nd_btree) if nd_btree else 0.0
-        avg_lat_btree = np.mean(lat_btree) if lat_btree else 0.0
-        avg_scan = np.mean(nd_scan) if nd_scan else 0.0
+        query_payloads.append((sel, sel_queries))
 
-        beam_str = f"{avg_r_beam:.3f} / {avg_nd_beam:6.0f}"
-        btree_str = f"{avg_r_btree:.3f} / {avg_nd_btree:6.0f} / {avg_lat_btree:5.2f}ms"
-        print(f"{sel:>6.3f} | {avg_post:>17.3f} | {beam_str:>24} | {btree_str:>32} | {avg_scan:>9.0f}")
+        post_str = f"{np.mean(r_post):.3f} / {np.mean(lat_post):5.2f}ms"
+        beam_str = f"{np.mean(r_beam):.3f} / {np.mean(lat_beam):5.2f}ms / {np.mean(nd_beam):5.0f}"
+        scan_str = f"{np.mean(lat_scan):5.2f}ms / {np.mean(nd_scan):5.0f}"
+        btree_str = f"{np.mean(r_btree):.3f} / {np.mean(lat_btree):5.2f}ms / {np.mean(nd_btree):5.0f}"
 
-    # 4. Ingestion / Streaming Maintenance Comparison
-    print("\n[4] Streaming Appends Maintenance Cost (8,000 Vectors Ingestion):")
+        print(f"{sel:>6.3f} | {post_str:>23} | {beam_str:>29} | {scan_str:>23} | {btree_str:>33}")
+
+    # 4. Multi-Threaded Concurrent Query Workload (16-thread pool across cores)
+    print(f"\n[4] Multi-Core Concurrent Batch Workload Evaluation ({num_cpus} Worker Threads):")
+    batch_header = (f"{'Sel':>6} | "
+                    f"{'Trad. Beam (Time / QPS)':>25} | "
+                    f"{'Exact Scan (Time / QPS)':>25} | "
+                    f"{'Hilbert B-Tree (Time / QPS)':>27} | "
+                    f"{'Throughput Speedup':>18}")
+    print(batch_header)
+    print("-" * len(batch_header))
+
+    for sel, queries in query_payloads:
+        if not queries:
+            continue
+        num_q = len(queries)
+
+        # Baseline: Traditional Filtered Beam Search Concurrent
+        t0 = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_cpus) as pool:
+            futures = [pool.submit(traditional_filtered_beam_search, q, in_r, k, ef)
+                       for q, lo, hi, in_r, vg, vs, tr in queries]
+            _ = [f.result() for f in futures]
+        t_beam_batch = (time.perf_counter() - t0) * 1000.0
+        qps_beam = num_q / (t_beam_batch / 1000.0)
+
+        # Baseline: Exact SIMD Scan Concurrent
+        t0 = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_cpus) as pool:
+            futures = [pool.submit(run_simd_scan, q, vg)
+                       for q, lo, hi, in_r, vg, vs, tr in queries]
+            _ = [f.result() for f in futures]
+        t_scan_batch = (time.perf_counter() - t0) * 1000.0
+        qps_scan = num_q / (t_scan_batch / 1000.0)
+
+        # Hilbert B-Tree Concurrent Batch Search
+        t0 = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_cpus) as pool:
+            futures = [pool.submit(engine.search, q, lo_raw=lo, hi_raw=hi, k=k, ef=ef, parallel=False)
+                       for q, lo, hi, in_r, vg, vs, tr in queries]
+            _ = [f.result() for f in futures]
+        t_btree_batch = (time.perf_counter() - t0) * 1000.0
+        qps_btree = num_q / (t_btree_batch / 1000.0)
+
+        speedup_str = f"{qps_btree / qps_beam:.2f}x vs Beam"
+        beam_batch_str = f"{t_beam_batch:6.1f}ms / {qps_beam:5.1f} QPS"
+        scan_batch_str = f"{t_scan_batch:6.1f}ms / {qps_scan:5.1f} QPS"
+        btree_batch_str = f"{t_btree_batch:6.1f}ms / {qps_btree:5.1f} QPS"
+
+        print(f"{sel:>6.3f} | {beam_batch_str:>25} | {scan_batch_str:>25} | {btree_batch_str:>27} | {speedup_str:>18}")
+
+    # 5. Ingestion / Streaming Maintenance Comparison
+    print("\n[5] Streaming Appends Maintenance Cost (8,000 Vectors Ingestion):")
     n_appends = 8_000
     X_new = rng.standard_normal((n_appends, d)).astype("float32")
     A_new = rng.random((n_appends, 2)).astype("float32")
@@ -204,9 +286,9 @@ def run_comparison():
     print(f"      -> ZERO cross-partition rewiring; executed localized median splits only on full leaves.")
 
     engine.close()
-    print("\n" + "=" * 95)
+    print("\n" + "=" * 110)
     print("Comparative Benchmark Completed Successfully!")
-    print("=" * 95)
+    print("=" * 110)
 
 
 if __name__ == "__main__":
