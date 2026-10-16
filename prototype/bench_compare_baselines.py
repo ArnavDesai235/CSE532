@@ -28,6 +28,7 @@ from hilbert_btree import HilbertHNSWEngine
 def run_comparison():
     rng = np.random.default_rng(42)
     n = 40_000
+    m = 2
     d, nq, k, ef = 32, 50, 10, 64
     max_leaf_size = 10_000
     for i, arg in enumerate(sys.argv):
@@ -37,40 +38,65 @@ def run_comparison():
             max_leaf_size = int(sys.argv[i + 1])
         elif arg == "--nq" and i + 1 < len(sys.argv):
             nq = int(sys.argv[i + 1])
+        elif arg in ("--m", "--n-attr") and i + 1 < len(sys.argv):
+            m = int(sys.argv[i + 1])
     if n >= 500_000 and "--max-leaf-size" not in sys.argv:
-        max_leaf_size = 50_000
+        max_leaf_size = 20_000 if m >= 8 else 50_000
     if n >= 500_000 and "--nq" not in sys.argv:
         nq = 20
     num_cpus = os.cpu_count() or 4
 
+    def make_query_box(sel, qi):
+        side = np.sqrt(sel)
+        lo = np.zeros(m, dtype=np.float32)
+        hi = np.ones(m, dtype=np.float32)
+        subspace_idx = qi % max(1, m // 2)
+        a1 = subspace_idx * 2
+        a2 = min(m - 1, a1 + 1)
+        if a1 == a2:
+            c = rng.random() * (1.0 - sel)
+            lo[a1] = c
+            hi[a1] = c + sel
+        else:
+            c = rng.random(2) * (1.0 - side)
+            lo[a1] = c[0]
+            hi[a1] = c[0] + side
+            lo[a2] = c[1]
+            hi[a2] = c[1] + side
+        return lo, hi
+
     print("=" * 110)
     print(f"CSE532 Comparative Benchmark: Hilbert-Partitioned B-Tree vs. Traditional KNN Graphs ({num_cpus} CPU Cores)")
+    print(f"Configuration: N={n:,}, d={d}, m={m} attributes, max_leaf_size={max_leaf_size:,}, nq={nq}")
     print("=" * 110)
 
     corr = "--corr" in sys.argv
     clusters = "--clusters" in sys.argv
     if clusters:
         X = np.empty((n, d), dtype=np.float32)
-        A = np.empty((n, 2), dtype=np.float32)
+        A = np.empty((n, m), dtype=np.float32)
         n1 = int(n * 0.25)
         n2 = int(n * 0.375)
         n3 = n - n1 - n2
         X[:n1] = rng.normal(loc=0.0, scale=0.1, size=(n1, d))
-        A[:n1] = rng.uniform(0.0, 0.25, size=(n1, 2))
+        A[:n1] = rng.uniform(0.0, 0.25, size=(n1, m))
         X[n1:n1 + n2] = rng.normal(loc=2.0, scale=1.0, size=(n2, d))
-        A[n1:n1 + n2] = rng.uniform(0.25, 0.6, size=(n2, 2))
+        A[n1:n1 + n2] = rng.uniform(0.25, 0.6, size=(n2, m))
         X[n1 + n2:] = rng.normal(loc=5.0, scale=3.0, size=(n3, d))
-        A[n1 + n2:] = rng.uniform(0.6, 1.0, size=(n3, 2))
+        A[n1 + n2:] = rng.uniform(0.6, 1.0, size=(n3, m))
         print("Attribute Distribution: MULTI-DENSITY CLUSTERED vector space (dense vs sparse partitions)")
     elif corr:
         X = rng.standard_normal((n, d)).astype("float32")
-        A = X[:, :2] + 0.4 * rng.standard_normal((n, 2))
-        A = (A - A.min(0)) / (A.max(0) - A.min(0))
+        A = np.empty((n, m), dtype=np.float32)
+        for j in range(m):
+            v_idx = j % d
+            A[:, j] = X[:, v_idx] + 0.4 * rng.standard_normal(n)
+            A[:, j] = (A[:, j] - A[:, j].min()) / (A[:, j].max() - A[:, j].min())
         print("Attribute Distribution: CORRELATED with vector embedding space")
     else:
         X = rng.standard_normal((n, d)).astype("float32")
-        A = rng.random((n, 2)).astype("float32")
-        print("Attribute Distribution: INDEPENDENT uniform attributes")
+        A = rng.random((n, m)).astype("float32")
+        print(f"Attribute Distribution: INDEPENDENT uniform attributes ({m} dimensions)")
 
     Q = rng.standard_normal((nq, d)).astype("float32")
 
@@ -215,9 +241,7 @@ def run_comparison():
         sel_queries = []
 
         for qi in range(nq):
-            side = np.sqrt(sel)
-            c = rng.random(2) * (1.0 - side)
-            lo, hi = c, c + side
+            lo, hi = make_query_box(sel, qi)
 
             in_range = np.all((A >= lo) & (A <= hi), axis=1)
             valid_gids = np.where(in_range)[0]
@@ -320,7 +344,7 @@ def run_comparison():
     n_appends = min(8_000, max(1_000, n // 5))
     print(f"\n[6] Streaming Appends Maintenance Cost ({n_appends:,} Vectors Ingestion):")
     X_new = rng.standard_normal((n_appends, d)).astype("float32")
-    A_new = rng.random((n_appends, 2)).astype("float32")
+    A_new = rng.random((n_appends, m)).astype("float32")
 
     # Traditional HNSW sequential insertion
     t0 = time.time()

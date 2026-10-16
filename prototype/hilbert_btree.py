@@ -214,7 +214,7 @@ def interleave_subspace_keys(keys_list, bits=16):
     for bit_idx in range(bits):
         for s_idx in range(S):
             b = (np.uint64(keys_list[s_idx]) >> np.uint64(bit_idx)) & np.uint64(1)
-            target_shift = np.uint64(bit_idx * S + s_idx)
+            target_shift = np.uint64(bit_idx * S + (S - 1 - s_idx))
             if target_shift < 64:
                 res |= (b << target_shift)
     return res
@@ -226,7 +226,7 @@ def deinterleave_subspace_keys(master_keys, S, bits=16):
     out = [np.zeros_like(master_keys) for _ in range(S)]
     for bit_idx in range(bits):
         for s_idx in range(S):
-            src_shift = np.uint64(bit_idx * S + s_idx)
+            src_shift = np.uint64(bit_idx * S + (S - 1 - s_idx))
             if src_shift < 64:
                 b = (master_keys >> src_shift) & np.uint64(1)
                 out[s_idx] |= (b << np.uint64(bit_idx))
@@ -253,10 +253,14 @@ class HilbertSpace:
 
         self.S = len(self.subspaces)
         self.sub_dims = [len(s) for s in self.subspaces]
+        total_dims = sum(self.sub_dims)
+        # Adapt p if total key bits exceed 60
+        if total_dims * self.p > 60:
+            self.p = max(2, 60 // total_dims)
         total_bits = sum(d * self.p for d in self.sub_dims)
         assert total_bits <= 63, f"Total key bits ({total_bits}) must fit in uint64 (<= 63 bits)"
 
-        self.curves = [HilbertCurve(p, d) for d in self.sub_dims]
+        self.curves = [HilbertCurve(self.p, d) for d in self.sub_dims]
         self.bits_per_sub = self.p * max(self.sub_dims)
         self.max_key = np.uint64((1 << total_bits) - 1)
 
@@ -287,7 +291,11 @@ class HilbertSpace:
     def decompose(self, lo_raw, hi_raw, max_depth=6):
         """Decomposes an m-dimensional bounding box [lo_raw, hi_raw] into disjoint
         merged 1D bit-interleaved Hilbert key intervals [start, end).
+        For high dimensions (m > 4), octree recursion explodes (2^m >= 32); in this regime,
+        the Zone Map handles chunk pruning directly, so we return an empty interval list.
         """
+        if self.m > 4:
+            return []
         lo = self.quantize(lo_raw)
         hi = self.quantize(hi_raw)
         max_depth = min(self.p, max_depth)
@@ -431,28 +439,33 @@ class LeafSubgraph:
         return np.einsum("ij,ij->i", diff, diff)
 
     def find_matching_local(self, intervals, lo_raw, hi_raw, space):
-        """Finds local matching indices inside this leaf given global Hilbert intervals."""
-        lo_q = space.quantize(lo_raw)
-        hi_q = space.quantize(hi_raw)
-        sk = self.skeys
-        slices = []
-        for s, e in intervals:
-            if s >= self.k_max or e <= self.k_min:
-                continue
-            ls = max(s, self.k_min)
-            le = min(e, self.k_max)
-            a = np.searchsorted(sk, np.uint64(ls))
-            b = np.searchsorted(sk, np.uint64(le))
-            if b > a:
-                slices.append((a, b))
+        """Finds local matching indices inside this leaf."""
+        if intervals:
+            lo_q = space.quantize(lo_raw)
+            hi_q = space.quantize(hi_raw)
+            sk = self.skeys
+            slices = []
+            for s, e in intervals:
+                if s >= self.k_max or e <= self.k_min:
+                    continue
+                ls = max(s, self.k_min)
+                le = min(e, self.k_max)
+                a = np.searchsorted(sk, np.uint64(ls))
+                b = np.searchsorted(sk, np.uint64(le))
+                if b > a:
+                    slices.append((a, b))
 
-        if not slices:
-            return np.empty(0, dtype=np.int64)
-        cands = np.concatenate([self.order[a:b] for a, b in slices])
-        # Exact scalar refinement
-        aq = space.quantize(self.A[cands])
-        valid_mask = np.all((aq >= lo_q) & (aq <= hi_q), axis=1)
-        return cands[valid_mask]
+            if not slices:
+                return np.empty(0, dtype=np.int64)
+            cands = np.concatenate([self.order[a:b] for a, b in slices])
+            # Exact scalar refinement
+            aq = space.quantize(self.A[cands])
+            valid_mask = np.all((aq >= lo_q) & (aq <= hi_q), axis=1)
+            return cands[valid_mask]
+
+        # Fast SIMD vectorized match over leaf attributes when intervals is None/empty
+        valid_mask = np.all((self.A >= lo_raw) & (self.A <= hi_raw), axis=1)
+        return np.where(valid_mask)[0]
 
     def search_unconstrained(self, q, k=10, ef=64, shared_state=None):
         """Mode 1: Pure Vanilla Unconstrained HNSW (0% filtering overhead)."""
@@ -653,14 +666,16 @@ class HilbertBTreeRouter:
                 # Disjoint: Pruned!
                 continue
 
-            # 2. Key interval check
-            overlap = False
-            for s, e in intervals:
-                if not (e <= leaf.k_min or s >= leaf.k_max):
-                    overlap = True
-                    break
-
-            if overlap:
+            # 2. Key interval check (if intervals provided and non-empty)
+            if intervals:
+                overlap = False
+                for s, e in intervals:
+                    if not (e <= leaf.k_min or s >= leaf.k_max):
+                        overlap = True
+                        break
+                if overlap:
+                    boundary.append(leaf)
+            else:
                 boundary.append(leaf)
 
         return enclosed, boundary
