@@ -73,7 +73,7 @@ def run_benchmark():
     print(f"\n[1] Building Hilbert B-Tree Engine (N={n}, d={d}, max_leaf_size={max_leaf_size})...")
     t0 = time.time()
     engine = HilbertHNSWEngine(X, A, p=10, max_leaf_size=max_leaf_size,
-                               M_min=12, M_max=32, M_base=20, scan_threshold=300)
+                               M_min=12, M_max=32, M_base=20, scan_threshold=None)
     build_time = time.time() - t0
     num_leaves = len(engine.router.leaves)
     degrees = [leaf.M for leaf in engine.router.leaves]

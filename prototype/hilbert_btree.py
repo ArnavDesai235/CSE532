@@ -705,13 +705,16 @@ class HilbertHNSWEngine:
     """The Complete Hilbert-Partitioned B-Tree Vector Engine."""
 
     def __init__(self, X, A, p=10, max_leaf_size=10000, buf_capacity=2000,
-                 M_min=12, M_max=32, M_base=20, scan_threshold=300, num_threads=None):
+                 M_min=12, M_max=32, M_base=20, scan_threshold=None, num_threads=None):
         self.n, self.d = X.shape
         self.m = A.shape[1]
         self.p = p
         self.max_leaf_size = max_leaf_size
         self.buf_capacity = buf_capacity
-        self.scan_threshold = scan_threshold
+        if scan_threshold is None:
+            self.scan_threshold = max(500, int(0.15 * max_leaf_size))
+        else:
+            self.scan_threshold = scan_threshold
         if num_threads is None:
             self.num_threads = min(8, os.cpu_count() or 4)
         else:
