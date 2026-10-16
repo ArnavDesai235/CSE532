@@ -18,8 +18,20 @@ from hilbert_btree import HilbertHNSWEngine
 
 def run_benchmark():
     rng = np.random.default_rng(42)
-    n, d, nq, k, ef = 40_000, 32, 50, 10, 64
+    n = 40_000
+    d, nq, k, ef = 32, 50, 10, 64
     max_leaf_size = 10_000
+    for i, arg in enumerate(sys.argv):
+        if arg == "--n" and i + 1 < len(sys.argv):
+            n = int(sys.argv[i + 1])
+        elif arg == "--max-leaf-size" and i + 1 < len(sys.argv):
+            max_leaf_size = int(sys.argv[i + 1])
+        elif arg == "--nq" and i + 1 < len(sys.argv):
+            nq = int(sys.argv[i + 1])
+    if n >= 500_000 and "--max-leaf-size" not in sys.argv:
+        max_leaf_size = 50_000
+    if n >= 500_000 and "--nq" not in sys.argv:
+        nq = 20
 
     print("=" * 80)
     print("CSE532 Prototype: Hilbert-Partitioned B-Tree of Subgraphs with Temporal Merging")
@@ -32,15 +44,18 @@ def run_benchmark():
         # Multi-density distribution: dense clusters vs dispersed background
         X = np.empty((n, d), dtype=np.float32)
         A = np.empty((n, 2), dtype=np.float32)
+        n1 = int(n * 0.25)
+        n2 = int(n * 0.375)
+        n3 = n - n1 - n2
         # Cluster 1: tight dense cluster (std=0.1)
-        X[:10000] = rng.normal(loc=0.0, scale=0.1, size=(10000, d))
-        A[:10000] = rng.uniform(0.0, 0.25, size=(10000, 2))
+        X[:n1] = rng.normal(loc=0.0, scale=0.1, size=(n1, d))
+        A[:n1] = rng.uniform(0.0, 0.25, size=(n1, 2))
         # Cluster 2: moderate dispersion (std=1.0)
-        X[10000:25000] = rng.normal(loc=2.0, scale=1.0, size=(15000, d))
-        A[10000:25000] = rng.uniform(0.25, 0.6, size=(15000, 2))
+        X[n1:n1 + n2] = rng.normal(loc=2.0, scale=1.0, size=(n2, d))
+        A[n1:n1 + n2] = rng.uniform(0.25, 0.6, size=(n2, 2))
         # Cluster 3: sparse/dispersed (std=3.0)
-        X[25000:] = rng.normal(loc=5.0, scale=3.0, size=(15000, d))
-        A[25000:] = rng.uniform(0.6, 1.0, size=(15000, 2))
+        X[n1 + n2:] = rng.normal(loc=5.0, scale=3.0, size=(n3, d))
+        A[n1 + n2:] = rng.uniform(0.6, 1.0, size=(n3, 2))
         print("Attribute Distribution: MULTI-DENSITY CLUSTERED vector space (dense vs sparse partitions)")
     elif corr:
         X = rng.standard_normal((n, d)).astype("float32")
@@ -261,7 +276,7 @@ def run_benchmark():
 
     # 7. Dynamic Streaming Appends & Localized Median Split Test
     print("\n[7] Testing Dynamic Stream Appends & Localized Median Leaf Splitting...")
-    n_appends = 8_000
+    n_appends = min(8_000, max(1_000, n // 5))
     print(f"    Streaming {n_appends} new vectors into Temporal Buffer (L0)...")
     X_new = rng.standard_normal((n_appends, d)).astype("float32")
     A_new = rng.random((n_appends, 2)).astype("float32")

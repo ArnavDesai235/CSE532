@@ -27,8 +27,20 @@ from hilbert_btree import HilbertHNSWEngine
 
 def run_comparison():
     rng = np.random.default_rng(42)
-    n, d, nq, k, ef = 40_000, 32, 50, 10, 64
+    n = 40_000
+    d, nq, k, ef = 32, 50, 10, 64
     max_leaf_size = 10_000
+    for i, arg in enumerate(sys.argv):
+        if arg == "--n" and i + 1 < len(sys.argv):
+            n = int(sys.argv[i + 1])
+        elif arg == "--max-leaf-size" and i + 1 < len(sys.argv):
+            max_leaf_size = int(sys.argv[i + 1])
+        elif arg == "--nq" and i + 1 < len(sys.argv):
+            nq = int(sys.argv[i + 1])
+    if n >= 500_000 and "--max-leaf-size" not in sys.argv:
+        max_leaf_size = 50_000
+    if n >= 500_000 and "--nq" not in sys.argv:
+        nq = 20
     num_cpus = os.cpu_count() or 4
 
     print("=" * 110)
@@ -40,12 +52,15 @@ def run_comparison():
     if clusters:
         X = np.empty((n, d), dtype=np.float32)
         A = np.empty((n, 2), dtype=np.float32)
-        X[:10000] = rng.normal(loc=0.0, scale=0.1, size=(10000, d))
-        A[:10000] = rng.uniform(0.0, 0.25, size=(10000, 2))
-        X[10000:25000] = rng.normal(loc=2.0, scale=1.0, size=(15000, d))
-        A[10000:25000] = rng.uniform(0.25, 0.6, size=(15000, 2))
-        X[25000:] = rng.normal(loc=5.0, scale=3.0, size=(15000, d))
-        A[25000:] = rng.uniform(0.6, 1.0, size=(15000, 2))
+        n1 = int(n * 0.25)
+        n2 = int(n * 0.375)
+        n3 = n - n1 - n2
+        X[:n1] = rng.normal(loc=0.0, scale=0.1, size=(n1, d))
+        A[:n1] = rng.uniform(0.0, 0.25, size=(n1, 2))
+        X[n1:n1 + n2] = rng.normal(loc=2.0, scale=1.0, size=(n2, d))
+        A[n1:n1 + n2] = rng.uniform(0.25, 0.6, size=(n2, 2))
+        X[n1 + n2:] = rng.normal(loc=5.0, scale=3.0, size=(n3, d))
+        A[n1 + n2:] = rng.uniform(0.6, 1.0, size=(n3, 2))
         print("Attribute Distribution: MULTI-DENSITY CLUSTERED vector space (dense vs sparse partitions)")
     elif corr:
         X = rng.standard_normal((n, d)).astype("float32")
@@ -302,8 +317,8 @@ def run_comparison():
         print(f"{sel:>6.3f} | {beam_batch_str:>25} | {scan_batch_str:>25} | {btree_batch_str:>27} | {speedup_str:>18}")
 
     # 6. Ingestion / Streaming Maintenance Comparison
-    print("\n[6] Streaming Appends Maintenance Cost (8,000 Vectors Ingestion):")
-    n_appends = 8_000
+    n_appends = min(8_000, max(1_000, n // 5))
+    print(f"\n[6] Streaming Appends Maintenance Cost ({n_appends:,} Vectors Ingestion):")
     X_new = rng.standard_normal((n_appends, d)).astype("float32")
     A_new = rng.random((n_appends, 2)).astype("float32")
 
