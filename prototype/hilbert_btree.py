@@ -124,6 +124,86 @@ class SharedSearchState:
         return out_ids, out_dists
 
 
+class MapReduceCollation:
+    """Multi-threaded hierarchical MapReduce tree collation for top-k candidates across subgraphs."""
+
+    @staticmethod
+    def merge_pair(cand_a, cand_b, k):
+        """Merges two (gids, dists) candidate sets and retains the top-k in O(len(a) + len(b))."""
+        ids_a, dists_a = cand_a
+        ids_b, dists_b = cand_b
+        if len(ids_a) == 0:
+            return ids_b[:k], dists_b[:k]
+        if len(ids_b) == 0:
+            return ids_a[:k], dists_a[:k]
+
+        comb_ids = np.concatenate([ids_a, ids_b])
+        comb_dists = np.concatenate([dists_a, dists_b])
+
+        # If overlapping global IDs exist across boundaries, deduplicate
+        if len(comb_ids) > len(np.unique(comb_ids)):
+            _, uniq_idx = np.unique(comb_ids, return_index=True)
+            comb_ids = comb_ids[uniq_idx]
+            comb_dists = comb_dists[uniq_idx]
+
+        if len(comb_ids) <= k:
+            order = np.argsort(comb_dists)
+            return comb_ids[order], comb_dists[order]
+
+        top_k_idx = np.argpartition(comb_dists, k)[:k]
+        sorted_sub = top_k_idx[np.argsort(comb_dists[top_k_idx])]
+        return comb_ids[sorted_sub], comb_dists[sorted_sub]
+
+    @classmethod
+    def tree_reduce(cls, candidate_lists, k, executor=None, parallel=True):
+        """Hierarchically merges P candidate lists into global top-k using a binary reduction tree."""
+        valid_lists = [(c[0], c[1]) for c in candidate_lists if len(c[0]) > 0]
+        if not valid_lists:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+        if len(valid_lists) == 1:
+            ids, dists = valid_lists[0]
+            order = np.argsort(dists)[:k]
+            return ids[order], dists[order]
+
+        current = valid_lists
+        while len(current) > 1:
+            pairs = []
+            pass_through = []
+            for i in range(0, len(current) - 1, 2):
+                pairs.append((current[i], current[i + 1]))
+            if len(current) % 2 == 1:
+                pass_through.append(current[-1])
+
+            if parallel and executor is not None and len(pairs) > 1:
+                futures = [executor.submit(cls.merge_pair, p[0], p[1], k) for p in pairs]
+                merged = [f.result() for f in futures]
+            else:
+                merged = [cls.merge_pair(p[0], p[1], k) for p in pairs]
+
+            current = merged + pass_through
+
+        return current[0]
+
+    @classmethod
+    def flat_reduce(cls, candidate_lists, k):
+        """Baseline single-threaded flat collation via concatenation + np.argpartition."""
+        valid_lists = [c for c in candidate_lists if len(c[0]) > 0]
+        if not valid_lists:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+        all_ids = np.concatenate([c[0] for c in valid_lists])
+        all_dists = np.concatenate([c[1] for c in valid_lists])
+        if len(all_ids) > len(np.unique(all_ids)):
+            _, uniq_idx = np.unique(all_ids, return_index=True)
+            all_ids = all_ids[uniq_idx]
+            all_dists = all_dists[uniq_idx]
+        if len(all_ids) <= k:
+            order = np.argsort(all_dists)
+            return all_ids[order], all_dists[order]
+        top_k_idx = np.argpartition(all_dists, k)[:k]
+        sorted_sub = top_k_idx[np.argsort(all_dists[top_k_idx])]
+        return all_ids[sorted_sub], all_dists[sorted_sub]
+
+
 class HilbertSpace:
     """Handles m-dimensional scalar attribute quantization and Hilbert curve decomposition."""
 
@@ -724,7 +804,7 @@ class HilbertHNSWEngine:
             "total_mb": total_bytes / (1024 * 1024),
         }
 
-    def search(self, q, lo_raw=None, hi_raw=None, k=10, ef=64, parallel=True):
+    def search(self, q, lo_raw=None, hi_raw=None, k=10, ef=64, parallel=True, collation="mapreduce"):
         """Cost-based adaptive search supporting:
 
           1. Pure Unconstrained ANN (Bypass with Shared Top-K Bound).
@@ -732,6 +812,12 @@ class HilbertHNSWEngine:
           3. SIMD Scan on small boundary slices.
           4. Hilbert-Seeded 2-hop HNSW on large boundary slices.
           5. Parallel multi-subgraph execution with shared-state branch-and-bound early exit.
+          6. Multi-threaded MapReduce hierarchical tree collation across leaf candidates.
+
+        collation: 'mapreduce' (Hybrid branch-and-bound Map + parallel tree reduce),
+                   'pure_mapreduce' (Decoupled Map tasks + parallel tree reduce),
+                   'shared_heap' (Concurrent locked insertions into SharedSearchState),
+                   'flat' (Map + flat numpy argpartition reduction).
         """
         q = np.asarray(q, dtype=np.float32).ravel()
         stats = {
@@ -742,10 +828,12 @@ class HilbertHNSWEngine:
             "early_exits": 0,
             "parallel": parallel and (self.num_threads > 1),
             "mode": "hybrid",
+            "collation": collation,
         }
 
         self.flush()
-        shared_state = SharedSearchState(k=k, ef=ef)
+        # In pure_mapreduce, workers run completely decoupled with zero lock contention
+        shared_state = None if collation == "pure_mapreduce" else SharedSearchState(k=k, ef=ef)
         use_parallel = parallel and (self.num_threads > 1) and (self.executor is not None)
 
         # Fast Path 1: Pure Unconstrained ANN Search
@@ -760,17 +848,26 @@ class HilbertHNSWEngine:
 
             def _search_unconstrained_task(leaf):
                 ids, dists, nd = leaf.search_unconstrained(q, k=k, ef=ef, shared_state=shared_state)
-                return nd
+                return ids, dists, nd
 
             if use_parallel and len(leaf_tasks) > 1:
                 futures = [self.executor.submit(_search_unconstrained_task, leaf) for _, leaf in leaf_tasks]
-                total_ndis = sum(f.result() for f in concurrent.futures.as_completed(futures))
+                task_results = [f.result() for f in concurrent.futures.as_completed(futures)]
             else:
-                total_ndis = sum(_search_unconstrained_task(leaf) for _, leaf in leaf_tasks)
+                task_results = [_search_unconstrained_task(leaf) for _, leaf in leaf_tasks]
+
+            total_ndis = sum(r[2] for r in task_results)
+            cand_lists = [(r[0], r[1]) for r in task_results]
+
+            if collation == "shared_heap" and shared_state is not None:
+                out_ids, _ = shared_state.get_results()
+            elif collation == "flat":
+                out_ids, _ = MapReduceCollation.flat_reduce(cand_lists, k=k)
+            else:  # 'mapreduce' or 'pure_mapreduce' (default)
+                out_ids, _ = MapReduceCollation.tree_reduce(cand_lists, k=k, executor=self.executor, parallel=use_parallel)
 
             stats["ndis"] = total_ndis
-            stats["early_exits"] = shared_state.early_exits
-            out_ids, _ = shared_state.get_results()
+            stats["early_exits"] = shared_state.early_exits if shared_state is not None else 0
             return out_ids, stats
 
         # Filtered Path: Zone Map & Range decomposition routing
@@ -797,30 +894,39 @@ class HilbertHNSWEngine:
             _, leaf, kind = task_tuple
             if kind == "enclosed":
                 ids, dists, nd = leaf.search_unconstrained(q, k=k, ef=ef, shared_state=shared_state)
-                return nd
+                return ids, dists, nd
             else:  # boundary
-                if shared_state.is_full():
+                if shared_state is not None and shared_state.is_full():
                     dist_to_c = float(np.linalg.norm(q - leaf.centroid))
                     min_dist_to_leaf = max(0.0, dist_to_c - leaf.radius)
                     if (min_dist_to_leaf * min_dist_to_leaf) >= shared_state.get_bound():
                         shared_state.record_early_exit()
-                        return 1
+                        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32), 1
                 matching_ids = leaf.find_matching_local(intervals, lo_raw, hi_raw, self.space)
                 if len(matching_ids) == 0:
-                    return 0
+                    return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32), 0
                 if len(matching_ids) <= self.scan_threshold:
                     ids, dists, nd = leaf.search_scan(q, matching_ids, k=k, shared_state=shared_state)
                 else:
                     ids, dists, nd = leaf.search_seeded_hnsw(q, matching_ids, k=k, ef=ef, shared_state=shared_state)
-                return nd
+                return ids, dists, nd
 
         if use_parallel and len(tasks) > 1:
             futures = [self.executor.submit(_execute_filtered_task, t) for t in tasks]
-            total_ndis = sum(f.result() for f in concurrent.futures.as_completed(futures))
+            task_results = [f.result() for f in concurrent.futures.as_completed(futures)]
         else:
-            total_ndis = sum(_execute_filtered_task(t) for t in tasks)
+            task_results = [_execute_filtered_task(t) for t in tasks]
+
+        total_ndis = sum(r[2] for r in task_results)
+        cand_lists = [(r[0], r[1]) for r in task_results]
+
+        if collation == "shared_heap" and shared_state is not None:
+            out_ids, _ = shared_state.get_results()
+        elif collation == "flat":
+            out_ids, _ = MapReduceCollation.flat_reduce(cand_lists, k=k)
+        else:  # 'mapreduce' or 'pure_mapreduce' (default)
+            out_ids, _ = MapReduceCollation.tree_reduce(cand_lists, k=k, executor=self.executor, parallel=use_parallel)
 
         stats["ndis"] = total_ndis
-        stats["early_exits"] = shared_state.early_exits
-        out_ids, _ = shared_state.get_results()
+        stats["early_exits"] = shared_state.early_exits if shared_state is not None else 0
         return out_ids, stats

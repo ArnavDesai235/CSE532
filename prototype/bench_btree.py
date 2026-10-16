@@ -191,9 +191,50 @@ def run_benchmark():
     print(f"    Avg Distance Computations: {np.mean(uncons_ndis):.0f}")
     print(f"    Sequential Latency: {seq_ms:.2f}ms | Parallel Latency: {par_ms:.2f}ms (Speedup: {sp:.2f}x)")
 
+    # 5. Top-K Multi-Subgraph Collation Strategy Evaluation
+    print("\n[5] Top-K Multi-Subgraph Collation Strategy Evaluation:")
+    print(f"{'Collation Mode':<30} | {'Lat (k=10)':>12} | {'Lat (k=100)':>12} | {'Recall':>8} | {'Distance Comps':>15} | {'Early Exits':>12}")
+    print("-" * 100)
+
+    test_queries = []
+    side = np.sqrt(0.20)  # broad queries touching multiple partitions
+    for qi in range(min(nq, 25)):
+        c = rng.random(2) * (1.0 - side)
+        lo, hi = c, c + side
+        in_range = np.all((A >= lo) & (A <= hi), axis=1)
+        valid_gids = np.where(in_range)[0]
+        if len(valid_gids) >= 100:
+            diff = X[valid_gids] - Q[qi]
+            true_dists = np.einsum("ij,ij->i", diff, diff)
+            truth_10 = valid_gids[np.argsort(true_dists)[:10]]
+            truth_100 = valid_gids[np.argsort(true_dists)[:100]]
+            test_queries.append((Q[qi], lo, hi, truth_10, truth_100))
+
+    for mode_name, desc in [
+        ("mapreduce", "Parallel Tree Reduce (Hybrid)"),
+        ("flat", "Vectorized Flat Reduce"),
+        ("shared_heap", "Concurrent Shared Heap"),
+        ("pure_mapreduce", "Pure MapReduce (Decoupled)")
+    ]:
+        t0 = time.perf_counter()
+        r10_list, nd10_list, ee10_list = [], [], []
+        for q, lo, hi, tr10, _ in test_queries:
+            f_ids, st = engine.search(q, lo_raw=lo, hi_raw=hi, k=10, ef=64, parallel=True, collation=mode_name)
+            r10_list.append(calc_recall(f_ids, tr10))
+            nd10_list.append(st["ndis"])
+            ee10_list.append(st["early_exits"])
+        lat10 = (time.perf_counter() - t0) * 1000.0 / len(test_queries) if test_queries else 0.0
+
+        t0 = time.perf_counter()
+        for q, lo, hi, _, tr100 in test_queries:
+            f_ids, st = engine.search(q, lo_raw=lo, hi_raw=hi, k=100, ef=100, parallel=True, collation=mode_name)
+        lat100 = (time.perf_counter() - t0) * 1000.0 / len(test_queries) if test_queries else 0.0
+
+        print(f"{desc:<30} | {lat10:>10.2f}ms | {lat100:>10.2f}ms | {np.mean(r10_list):>8.3f} | {np.mean(nd10_list):>15.0f} | {np.mean(ee10_list):>12.1f}")
+
     # 6. Multi-Core Concurrent Query Batch Throughput (Full Machine Scaling)
     num_cpus = os.cpu_count() or 4
-    print(f"\n[5] Multi-Core Concurrent Batch Workload Evaluation ({num_cpus} Worker Threads):")
+    print(f"\n[6] Multi-Core Concurrent Batch Workload Evaluation ({num_cpus} Worker Threads):")
     print(f"{'Selectivity':>12} | {'Batch Queries':>14} | {'Total Time (ms)':>16} | {'Throughput (QPS)':>18} | {'Avg Latency (ms)':>18}")
     print("-" * 85)
 
@@ -219,7 +260,7 @@ def run_benchmark():
         print(f"{sel:>12.3f} | {len(batch_queries):>14} | {t_batch_ms:>16.2f} | {qps:>18.1f} | {avg_lat:>18.2f}")
 
     # 7. Dynamic Streaming Appends & Localized Median Split Test
-    print("\n[6] Testing Dynamic Stream Appends & Localized Median Leaf Splitting...")
+    print("\n[7] Testing Dynamic Stream Appends & Localized Median Leaf Splitting...")
     n_appends = 8_000
     print(f"    Streaming {n_appends} new vectors into Temporal Buffer (L0)...")
     X_new = rng.standard_normal((n_appends, d)).astype("float32")
