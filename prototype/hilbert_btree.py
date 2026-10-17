@@ -20,7 +20,44 @@ import threading
 import time
 import numpy as np
 import faiss
-from hilbertcurve.hilbertcurve import HilbertCurve
+try:
+    from hilbertcurve.hilbertcurve import HilbertCurve
+except ImportError:
+    class HilbertCurve:
+        """Pure-Python fallback implementation of Skilling's Hilbert curve algorithm."""
+        def __init__(self, p, n, n_procs=0):
+            self.p = p
+            self.n = n
+
+        def distance_from_point(self, point):
+            point = [int(el) for el in point]
+            m = 1 << (self.p - 1)
+            q = m
+            while q > 1:
+                p = q - 1
+                for i in range(self.n):
+                    if point[i] & q:
+                        point[0] ^= p
+                    else:
+                        t = (point[0] ^ point[i]) & p
+                        point[0] ^= t
+                        point[i] ^= t
+                q >>= 1
+            for i in range(1, self.n):
+                point[i] ^= point[i - 1]
+            t = 0
+            q = m
+            while q > 1:
+                if point[self.n - 1] & q:
+                    t ^= q - 1
+                q >>= 1
+            for i in range(self.n):
+                point[i] ^= t
+            x_bit_str = [bin(point[i])[2:].zfill(self.p) for i in range(self.n)]
+            return int("".join([y[i] for i in range(self.p) for y in x_bit_str]), 2)
+
+        def distances_from_points(self, points):
+            return [self.distance_from_point(pt) for pt in points]
 
 
 class SharedSearchState:

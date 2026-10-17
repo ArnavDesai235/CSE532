@@ -38,11 +38,9 @@ echo "==========================================================================
 # module load anaconda/3
 
 # ------------------------------------------------------------------------------
-# 2. Automated Conda Environment Creation & Activation
+# 2. Virtual Environment / Conda Activation
 # ------------------------------------------------------------------------------
-ENV_NAME="cse532-mpi"
-
-# Initialize Conda in bash subshell from common cluster locations if needed
+# Initialize Conda in bash subshell if needed
 if ! command -v conda &> /dev/null; then
     for conda_path in \
         "$HOME/miniconda3/etc/profile.d/conda.sh" \
@@ -58,41 +56,27 @@ if ! command -v conda &> /dev/null; then
 fi
 
 if command -v conda &> /dev/null; then
-    eval "$(conda shell.bash hook)"
-else
-    echo "ERROR: 'conda' command not found. Please ensure Conda or an Anaconda module is loaded."
-    exit 1
+    eval "$(conda shell.bash hook)" 2>/dev/null || true
 fi
 
-# Check if the custom Conda environment exists; if not, create it
-if ! conda info --envs | awk '{print $1}' | grep -qx "$ENV_NAME"; then
-    echo "=============================================================================="
-    echo "Creating new Conda environment '$ENV_NAME' with Python 3.10..."
-    conda create -y -n "$ENV_NAME" python=3.10
-    conda activate "$ENV_NAME"
-
-    echo "Installing required HPC packages (mpi4py, faiss-cpu, numpy) from conda-forge..."
-    conda install -y -c conda-forge mpi4py faiss-cpu numpy
-
-    echo "Installing hilbertcurve via pip..."
-    pip install hilbertcurve
-    echo "Conda environment '$ENV_NAME' created and configured successfully!"
-    echo "=============================================================================="
-else
-    echo "Existing Conda environment '$ENV_NAME' detected. Activating..."
-    conda activate "$ENV_NAME"
-
-    # Verify all required dependencies are present; install if missing
-    python -c "import faiss, mpi4py, hilbertcurve, numpy" 2>/dev/null || {
-        echo "Missing dependencies detected. Installing required packages into '$ENV_NAME'..."
-        conda install -y -c conda-forge mpi4py faiss-cpu numpy
-        pip install hilbertcurve
-    }
+# Activate environment if specified or if CONDA_DEFAULT_ENV is present
+# (User assumes Python and Faiss are already installed in this environment)
+if [ -n "$CONDA_DEFAULT_ENV" ]; then
+    echo "Using currently active Conda environment: $CONDA_DEFAULT_ENV"
+elif [ -n "$1" ]; then
+    echo "Activating requested environment: $1"
+    conda activate "$1" 2>/dev/null || true
+elif [ -d ".venv" ]; then
+    echo "Activating local .venv directory..."
+    source .venv/bin/activate 2>/dev/null || true
 fi
 
 PYTHON_BIN=$(which python)
-echo "Active Virtual Environment: $CONDA_PREFIX"
-echo "Active Python Binary: $PYTHON_BIN ($($PYTHON_BIN --version))"
+echo "Resolved Python Binary: $PYTHON_BIN"
+$PYTHON_BIN -c "import sys, numpy; print('Python:', sys.version.split()[0], '| NumPy:', numpy.__version__)"
+$PYTHON_BIN -c "import faiss; print('Faiss: Successfully loaded from', faiss.__file__)" || {
+    echo "WARNING: Could not import faiss. Please activate the Conda environment where Faiss is installed."
+}
 
 # ------------------------------------------------------------------------------
 # 3. Thread Affinity & OpenMP Configuration
