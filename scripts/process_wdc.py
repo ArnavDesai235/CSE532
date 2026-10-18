@@ -470,8 +470,16 @@ class WDCDatasetView:
 
 
 def load_processed_wdc(output_dir="data/wdc_processed", max_items=None):
-    """Convenience function to load processed vectors and attributes."""
-    view = WDCDatasetView(output_dir)
+    """Convenience function to load processed vectors and attributes.
+    Automatically checks SeaWulf /gpfs/scratch/$USER/cse532_wdc/processed if local path is absent.
+    """
+    target = Path(output_dir)
+    if not target.exists():
+        user = os.environ.get("USER", "")
+        scratch_target = Path(f"/gpfs/scratch/{user}/cse532_wdc/processed")
+        if scratch_target.exists():
+            target = scratch_target
+    view = WDCDatasetView(target)
     return view.get_arrays(max_items=max_items)
 
 

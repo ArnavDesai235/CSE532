@@ -19,13 +19,35 @@
 #SBATCH --time=48:00:00             # Max walltime for a100-long (set 08:00:00 if using a100)
 #SBATCH --mem=200G                  # Host RAM allocation (node has 256GB total)
 
-# Create log directory
-mkdir -p logs data/wdc_raw data/wdc_processed
+# ------------------------------------------------------------------------------
+# Storage Configuration: Route to SeaWulf Scratch (/gpfs/scratch/$USER, 20 TB quota)
+# (Avoids overflowing the strict 20 GB home directory quota)
+# ------------------------------------------------------------------------------
+if [ -d "/gpfs/scratch/${USER}" ]; then
+    SCRATCH_BASE="/gpfs/scratch/${USER}"
+elif [ -n "$SCRATCH" ] && [ -d "$SCRATCH" ]; then
+    SCRATCH_BASE="$SCRATCH"
+else
+    SCRATCH_BASE="./scratch"
+fi
+
+WDC_SCRATCH_DIR="${SCRATCH_BASE}/cse532_wdc"
+RAW_DIR="${WDC_SCRATCH_DIR}/raw"
+PROCESSED_DIR="${WDC_SCRATCH_DIR}/processed"
+
+# Create directories on the 20 TB scratch filesystem
+mkdir -p logs "${RAW_DIR}" "${PROCESSED_DIR}" data
+
+# Symlink local data/wdc_processed -> scratch for seamless local access
+ln -sfn "${PROCESSED_DIR}" data/wdc_processed
 
 echo "=============================================================================="
 echo "Starting SeaWulf WDC Ingestion Job: $SLURM_JOB_NAME (Job ID: $SLURM_JOB_ID)"
 echo "Node Allocated: $SLURM_JOB_NODELIST"
 echo "Partition: $SLURM_JOB_PARTITION"
+echo "Scratch Base: $SCRATCH_BASE (20 TB SeaWulf Scratch Storage)"
+echo "Raw Shard Cache: $RAW_DIR"
+echo "Processed Output: $PROCESSED_DIR"
 echo "GPUs Assigned: $CUDA_VISIBLE_DEVICES"
 echo "CPUs Allocated: $SLURM_CPUS_PER_TASK"
 echo "Start Time: $(date)"
@@ -90,8 +112,8 @@ export PYTHONUNBUFFERED=1
 #   --delete-raw   : Deletes temporary raw .json.gz shard to prevent quota overflow
 $PYTHON_BIN scripts/process_wdc.py \
     --url-list data/wdc_urls.txt \
-    --data-dir data/wdc_raw \
-    --output-dir data/wdc_processed \
+    --data-dir "${RAW_DIR}" \
+    --output-dir "${PROCESSED_DIR}" \
     --model-name "Alibaba-NLP/gte-large-en-v1.5" \
     --dim 1024 \
     --fp16 \
