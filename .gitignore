@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+logs/
+data/wdc_raw/
+data/wdc_processed/

@@ -1,0 +1,8 @@
+# Web Data Commons (WDC) Product Corpus Shard URLs
+# Format: One HTTP/HTTPS URL per line. Lines starting with # are comments.
+#
+# Production Source:
+# http://data.dws.informatik.uni-mannheim.de/webdatacommons/products/
+#
+# Replace the sample URLs below with the exact WDC split/shard links you wish to process:
+http://data.dws.informatik.uni-mannheim.de/webdatacommons/products/sample_products_01.json.gz
