@@ -95,7 +95,7 @@ partition name differs, edit the `#SBATCH -p` lines or submit with `sbatch -p <n
 ## Resuming and troubleshooting
 
 - **Job hit the time limit**: run `bash submit.sh pipeline` again. Step 2b resumes from
-  `category_cache.json` (saved every 2,000 labels); step 3 resumes from `dataset/progress.json`.
+  `category_cache.json` (saved every 500 labels); step 3 resumes from `dataset/progress.json`.
 - **`No chunk names found in Product_lookup.csv`**: WDC changed the lookup format. Check
   `head ~/cse532_wdc/Product_lookup.csv` and adjust the `grep` pattern in `00_download.sh`.
 - **`Model ... missing; pulling` inside a job fails**: compute nodes have no internet. Run

@@ -87,7 +87,7 @@ def save_cache(cache):
     json.dump(cache, open(tmp, "w"))
     os.replace(tmp, CACHE_FILE)   # atomic: a kill mid-write never corrupts the cache
 
-def run(keys, texts, cache, chunk=2000):
+def run(keys, texts, cache, chunk=500):
     labels = cache["labels"]
     todo = [(k, t) for k, t in zip(keys, texts) if k not in labels]
     print(f"{len(keys) - len(todo):,} cached, {len(todo):,} to classify", flush=True)
