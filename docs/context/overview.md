@@ -43,6 +43,21 @@ estimates predicate selectivity by intersecting the filter's range with the curv
 - Online updates and deletes
 - Production-grade engine integration
 
+## Dataset
+Real-world benchmark data comes from the Web Data Commons Schema.org Product corpus
+(Oct 2024). Pipeline and run instructions: `data_pipeline/README.md`.
+- Sample: 10 random corpus chunks (seed 532), at most 2,000 products per website,
+  500k products total.
+- Vectors: `nomic-embed-text` (768-d) over name + specs + description.
+- Filter attributes: `cat_id` (LLM-proposed, human-reviewed taxonomy of 20–40 classes,
+  assigned by `qwen2.5:7b` through Ollama), `price_usd`, and `brand_id`. They are not
+  embedded, so vectors and filters stay independent.
+- Runs as SLURM jobs (`defq`); Lawrence runs it.
+- Before benchmarking: the prototype assumes uniform numeric attributes in [0,1]. `cat_id`
+  is categorical (risk 3), `price_usd` is skewed and has NaNs (needs a rank transform and a
+  missing-value bucket), and `brand_id` is high-cardinality (better as a post-check than a
+  curve dimension).
+
 ## Deliverable
 | Deliverable | Weight | Due |
 |---|---|---|

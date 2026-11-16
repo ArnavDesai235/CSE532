@@ -1,0 +1,12 @@
+name: cse532_wdc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pandas>=2.1
+  - pyarrow>=14
+  - numpy>=1.26,<3
+  - curl
+  - pip
+  - pip:
+      - ollama>=0.4   # Python client; >=0.4 needed for r.message.content / ollama.embed
