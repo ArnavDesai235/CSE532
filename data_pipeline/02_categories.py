@@ -21,17 +21,27 @@ def ask_json(prompt, schema):
                     messages=[{"role": "user", "content": prompt}])
     return json.loads(r.message.content)
 
-def propose_taxonomy(raw_counts, sample=3000, batch=150):
-    # frequency-weighted sample: most common raw strings + random tail
-    top = raw_counts.index[:sample // 2].tolist()
-    rest = raw_counts.index[sample // 2:].to_series()
-    pool = top + rest.sample(min(len(rest), sample - len(top)), random_state=0).tolist()
+def build_pool(df, sample=3000):
+    """Half raw category labels (most common + random tail), half product names. Names matter
+    because only ~6% of real WDC products carry a category; the rest are classified by name."""
+    raw_counts = df.category_raw.dropna().str.strip().value_counts()
+    raw_counts = raw_counts[raw_counts.index != ""]
+    k = min(sample // 2, len(raw_counts))
+    top = raw_counts.index[:k // 2].tolist()
+    rest = raw_counts.index[k // 2:].to_series()
+    cats = top + rest.sample(min(len(rest), k - len(top)), random_state=0).tolist()
+    names = df.name.drop_duplicates()
+    names = names.sample(min(len(names), sample - len(cats)), random_state=0).str[:80].tolist()
+    print(f"taxonomy pool: {len(cats):,} raw category labels + {len(names):,} product names")
+    pool = cats + names
+    return pd.Series(pool).sample(frac=1, random_state=0).tolist()   # mix labels and names per batch
 
-    # A1: each batch of raw labels -> up to 15 proposed categories; count how often each is proposed
+def propose_taxonomy(pool, batch=150):
+    # A1: each batch of labels/names -> up to 15 proposed categories; count how often each is proposed
     proposals = Counter()
     for i in range(0, len(pool), batch):
         try:
-            cats = ask_json("Below are raw e-commerce category labels from many websites.\n"
+            cats = ask_json("Below are e-commerce category labels and product names from many websites.\n"
                             "Propose up to 15 broad product categories (2-4 words each) that cover them.\n\n"
                             + "\n".join(pool[i:i + batch]), LIST_SCHEMA)["categories"]
             proposals.update(c.strip().title() for c in cats if c.strip())
@@ -98,7 +108,7 @@ df = pd.read_parquet(sys.argv[1])
 if os.path.exists(TAX_FILE):
     TAXONOMY = json.load(open(TAX_FILE))
 else:
-    TAXONOMY = propose_taxonomy(df.category_raw.dropna().str.strip().value_counts())
+    TAXONOMY = propose_taxonomy(build_pool(df))
     json.dump(TAXONOMY, open(TAX_FILE, "w"), indent=1)
 print(f"{len(TAXONOMY)} categories:", TAXONOMY)
 if os.environ.get("PROPOSE_ONLY"):

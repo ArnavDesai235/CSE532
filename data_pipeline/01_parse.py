@@ -85,6 +85,18 @@ def flush(url, nodes, out):
                         category_raw=cat, brand=brand, price=price, currency=cur,
                         specs=collect_specs(n, nodes), gtin=get_gtin(n)))
 
+import py3langid
+py3langid.set_languages(["en", "fr", "de", "es", "it", "pt", "nl", "pl", "cs", "ru", "uk", "sv", "da", "no",
+                         "fi", "tr", "ja", "zh", "ko", "ar", "id", "vi", "ro", "hu", "el", "he", "th"])
+
+def is_english(lang, name, desc):
+    """Most WDC pages carry no language tag (~80% in a real chunk), so detect it from the text.
+    Short ASCII-only texts (e.g. 'Nike Air Max 90') are too short for language ID: keep them."""
+    if lang: return lang.lower().startswith("en")
+    text = (name + ". " + (desc or "")[:300]).strip()
+    if len(text) < 40: return text.isascii()
+    return py3langid.classify(text)[0] == "en"
+
 def domain_of(url):
     d = urlparse(url).netloc.lower().split(":")[0]
     return d[4:] if d.startswith("www.") else d
@@ -128,7 +140,9 @@ def main(src, dst):
     df = pd.DataFrame(rows)
     print(f"{len(df):,} raw products from {df.domain.nunique():,} domains")
     df = df.drop_duplicates(["url", "name"])                       # microdata + json-ld dupes
-    df = df[df.lang.isna() | df.lang.str.startswith("en")]          # keep English / untagged
+    n0 = len(df)
+    df = df[[is_english(l, n, d) for l, n, d in zip(df.lang, df.name, df.description)]]
+    print(f"language filter kept {len(df):,} of {n0:,} (English)")
     n0 = len(df)
     df = df[df.gtin.isna() | ~df.gtin.duplicated()]                 # same product sold by several stores
     print(f"gtin dedup removed {n0 - len(df):,} cross-store duplicates")
